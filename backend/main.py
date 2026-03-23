@@ -327,6 +327,24 @@ def analyze_match(match_id: int, db: Session = Depends(get_db)):
     return {"status": "processing", "message": "Analysis started"}
 
 
+@app.post("/api/matches/{match_id}/cancel-analysis")
+def cancel_analysis(match_id: int, db: Session = Depends(get_db)):
+    """Cancel a running YOLO analysis. Also resets status if thread is dead."""
+    from video_processor import analysis_cancel, analysis_progress
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != MatchStatus.PROCESSING:
+        raise HTTPException(400, "No analysis in progress")
+    # Signal the thread to stop
+    analysis_cancel.add(match_id)
+    # Also force-reset status in case the thread already crashed
+    match.status = MatchStatus.UPLOADED
+    db.commit()
+    analysis_progress.pop(match_id, None)
+    return {"ok": True, "message": "Analysis cancelled"}
+
+
 @app.get("/api/matches/{match_id}/analysis-progress")
 def get_analysis_progress(match_id: int, db: Session = Depends(get_db)):
     """Get the current progress of YOLO analysis."""
@@ -413,31 +431,99 @@ def get_tracking_data(
     return {"frames": grouped}
 
 
+@app.get("/api/matches/{match_id}/tracking-bulk")
+def get_tracking_bulk(
+    match_id: int,
+    start: float = Query(0),
+    end: float = Query(10),
+    db: Session = Depends(get_db),
+):
+    """Get all tracking frames + assignments for a time window.
+
+    Returns sorted timestamps, boxes grouped by timestamp, and assignment map.
+    Designed for client-side pre-fetching in ~10s chunks.
+    """
+    frames = (
+        db.query(TrackingFrame)
+        .filter(
+            TrackingFrame.match_id == match_id,
+            TrackingFrame.timestamp_seconds >= start,
+            TrackingFrame.timestamp_seconds <= end,
+        )
+        .order_by(TrackingFrame.timestamp_seconds, TrackingFrame.track_id)
+        .all()
+    )
+
+    # Group by timestamp
+    grouped = {}
+    for f in frames:
+        ts = f.timestamp_seconds
+        if ts not in grouped:
+            grouped[ts] = []
+        grouped[ts].append({
+            "track_id": f.track_id,
+            "bbox": [f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h],
+        })
+
+    # Sorted list of timestamps for binary search on client
+    timestamps = sorted(grouped.keys())
+
+    # Load assignments once
+    assignments = {}
+    referee_tracks = []
+    for a in db.query(TrackAssignment).filter_by(match_id=match_id).all():
+        if a.is_referee:
+            referee_tracks.append(a.track_id)
+        elif a.player_id:
+            player = db.query(Player).filter_by(id=a.player_id).first()
+            if player:
+                assignments[str(a.track_id)] = {
+                    "player_id": player.id,
+                    "name": player.name,
+                    "jersey": player.jersey_number,
+                    "team_color": player.team.color,
+                    "team_name": player.team.name,
+                }
+
+    return {
+        "timestamps": timestamps,
+        "frames": grouped,
+        "assignments": assignments,
+        "referee_tracks": referee_tracks,
+        "start": start,
+        "end": end,
+    }
+
+
 @app.get("/api/matches/{match_id}/tracking-at")
 def get_tracking_at_time(
     match_id: int,
     t: float = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Get bounding boxes at the nearest tracked timestamp, with assignment info."""
-    # Find the nearest timestamp
-    nearest = (
+    """Get bounding boxes at the two nearest tracked timestamps for interpolation.
+
+    Returns `before` and `after` frame data plus a `ratio` (0-1) for lerp.
+    If exact match, ratio=0 and after is empty.
+    """
+    # Find the frame just before and just after t
+    ts_before = (
         db.query(TrackingFrame.timestamp_seconds)
-        .filter_by(match_id=match_id)
-        .order_by(func.abs(TrackingFrame.timestamp_seconds - t))
+        .filter(TrackingFrame.match_id == match_id, TrackingFrame.timestamp_seconds <= t)
+        .order_by(TrackingFrame.timestamp_seconds.desc())
         .first()
     )
-    if not nearest:
-        return {"timestamp": t, "boxes": [], "assignments": {}}
-
-    ts = nearest[0]
-    frames = (
-        db.query(TrackingFrame)
-        .filter_by(match_id=match_id, timestamp_seconds=ts)
-        .all()
+    ts_after = (
+        db.query(TrackingFrame.timestamp_seconds)
+        .filter(TrackingFrame.match_id == match_id, TrackingFrame.timestamp_seconds > t)
+        .order_by(TrackingFrame.timestamp_seconds.asc())
+        .first()
     )
 
-    # Load assignments with player info + referee flags
+    if not ts_before and not ts_after:
+        return {"before": {"timestamp": t, "boxes": []}, "after": None, "ratio": 0}
+
+    # Load assignments (shared for both frames)
     assignments = {}
     referee_tracks = set()
     for a in db.query(TrackAssignment).filter_by(match_id=match_id).all():
@@ -454,19 +540,31 @@ def get_tracking_at_time(
                     "team_name": player.team.name,
                 }
 
-    boxes = []
-    for f in frames:
-        box = {
-            "track_id": f.track_id,
-            "bbox": [f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h],
-        }
-        if f.track_id in referee_tracks:
-            box["is_referee"] = True
-        elif f.track_id in assignments:
-            box["player"] = assignments[f.track_id]
-        boxes.append(box)
+    def build_boxes(ts_val):
+        if ts_val is None:
+            return None
+        ts = ts_val[0]
+        frames = db.query(TrackingFrame).filter_by(match_id=match_id, timestamp_seconds=ts).all()
+        boxes = []
+        for f in frames:
+            box = {"track_id": f.track_id, "bbox": [f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h]}
+            if f.track_id in referee_tracks:
+                box["is_referee"] = True
+            elif f.track_id in assignments:
+                box["player"] = assignments[f.track_id]
+            boxes.append(box)
+        return {"timestamp": ts, "boxes": boxes}
 
-    return {"timestamp": ts, "boxes": boxes}
+    before = build_boxes(ts_before) or build_boxes(ts_after)
+    after = build_boxes(ts_after) if ts_before else None
+
+    # Compute interpolation ratio
+    ratio = 0
+    if before and after and after["timestamp"] != before["timestamp"]:
+        ratio = (t - before["timestamp"]) / (after["timestamp"] - before["timestamp"])
+        ratio = max(0, min(1, ratio))
+
+    return {"before": before, "after": after, "ratio": ratio}
 
 
 @app.delete("/api/matches/{match_id}/unassign-track")
@@ -580,6 +678,82 @@ def get_track_thumbnail(
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 # ─── Track ↔ Player Assignment ──────────────────────────────────────────────
+
+@app.post("/api/matches/{match_id}/auto-assign-tracks")
+def auto_assign_tracks_endpoint(
+    match_id: int,
+    threshold: float = Form(0.38),
+    db: Session = Depends(get_db),
+):
+    """Auto-assign unassigned tracks using multi-feature appearance matching (background thread)."""
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "analyzed":
+        raise HTTPException(400, "Match must be analyzed first")
+
+    from appearance import assignment_progress
+    # Check if already running
+    prog = assignment_progress.get(match_id)
+    if prog and 0 < prog.get("percent", 100) < 100:
+        raise HTTPException(400, "Auto-assignation déjà en cours")
+
+    # Set initial progress BEFORE starting the thread
+    assignment_progress[match_id] = {
+        "current": 0, "total": 0, "percent": 0,
+        "phase": "Démarrage...", "done": False,
+    }
+
+    from database import SessionLocal
+
+    def run_auto_assign():
+        session = SessionLocal()
+        try:
+            from appearance import auto_assign_tracks
+            result = auto_assign_tracks(match_id, session, threshold=threshold)
+            # Mark as done
+            assignment_progress[match_id] = {
+                "current": 1, "total": 1, "percent": 100,
+                "phase": "Terminé", "done": True,
+                "assigned_count": result.get("assigned_count", 0),
+                "message": result.get("message", ""),
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            assignment_progress[match_id] = {
+                "current": 0, "total": 0, "percent": 100,
+                "phase": f"Erreur: {e}", "done": True, "error": str(e),
+            }
+        finally:
+            session.close()
+
+    thread = threading.Thread(target=run_auto_assign, daemon=True)
+    thread.start()
+
+    return {"status": "processing", "message": "Auto-assignation lancée"}
+
+
+@app.get("/api/matches/{match_id}/auto-assign-progress")
+def get_auto_assign_progress(match_id: int):
+    """Get the current progress of auto-assignment."""
+    from appearance import assignment_progress
+    progress = assignment_progress.get(match_id, {
+        "current": 0, "total": 0, "percent": 0, "phase": "",
+    })
+    return progress
+
+
+@app.get("/api/matches/{match_id}/auto-assign-result")
+def get_auto_assign_result(match_id: int, db: Session = Depends(get_db)):
+    """Check if auto-assignment is done and return the result summary."""
+    from appearance import assignment_progress
+    progress = assignment_progress.get(match_id)
+    done = progress is not None and progress.get("percent", 0) >= 100
+    # Count assignments
+    count = db.query(TrackAssignment).filter_by(match_id=match_id).count()
+    return {"done": done, "total_assignments": count, "progress": progress}
+
 
 @app.post("/api/matches/{match_id}/assign-track")
 def assign_track(

@@ -38,6 +38,7 @@ export const uploadMatch = (formDataObj) =>
 
 // Analysis
 export const analyzeMatch = (id) => request(`/matches/${id}/analyze`, { method: 'POST' });
+export const cancelAnalysis = (id) => request(`/matches/${id}/cancel-analysis`, { method: 'POST' });
 export const getAnalysisProgress = (id) => request(`/matches/${id}/analysis-progress`);
 export const detectEvents = (matchId, attacksRight) =>
   request(`/matches/${matchId}/detect-events`, {
@@ -47,10 +48,16 @@ export const detectEvents = (matchId, attacksRight) =>
 export const getBallStats = (id) => request(`/matches/${id}/ball-stats`);
 export const getTracking = (id, start = 0, end = null) =>
   request(`/matches/${id}/tracking?start=${start}${end !== null ? `&end=${end}` : ''}`);
+export const getTrackingBulk = (id, start = 0, end = 10) =>
+  request(`/matches/${id}/tracking-bulk?start=${start}&end=${end}`);
 export const getTracks = (id, minFrames = 0) => request(`/matches/${id}/tracks?min_frames=${minFrames}`);
 export const trackThumbnailUrl = (matchId, trackId) => `${BASE}/matches/${matchId}/track-thumbnail?track_id=${trackId}`;
 export const assignTrack = (matchId, data) =>
   request(`/matches/${matchId}/assign-track`, { method: 'POST', body: formData(data) });
+export const autoAssignTracks = (matchId, threshold = 0.38) =>
+  request(`/matches/${matchId}/auto-assign-tracks`, { method: 'POST', body: formData({ threshold }) });
+export const getAutoAssignProgress = (matchId) => request(`/matches/${matchId}/auto-assign-progress`);
+export const getAutoAssignResult = (matchId) => request(`/matches/${matchId}/auto-assign-result`);
 export const markReferee = (matchId, trackId) =>
   request(`/matches/${matchId}/assign-track`, { method: 'POST', body: formData({ track_id: trackId, is_referee: true }) });
 export const unassignTrack = (matchId, trackId) =>

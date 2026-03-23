@@ -1,0 +1,16 @@
+# Custom BoT-SORT config optimized for futsal (5v5)
+# Players are closer together, more occlusions, frequent direction changes
+
+tracker_type: botsort
+track_high_thresh: 0.20        # Lower than default (0.25) — catch more detections
+track_low_thresh: 0.08         # Lower for second association pass
+new_track_thresh: 0.30         # Slightly higher — avoid creating noise tracks
+track_buffer: 90               # 3x default (30) — keep lost tracks alive longer through occlusions
+match_thresh: 0.85             # Slightly more permissive matching
+fuse_score: True
+
+# BoT-SORT settings
+gmc_method: sparseOptFlow      # Camera motion compensation (important for handheld footage)
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False

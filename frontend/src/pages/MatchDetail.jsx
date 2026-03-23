@@ -1,10 +1,11 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import {
   getMatch, getEvents, createEvent, deleteEvent,
-  analyzeMatch, getAnalysisProgress, getTracks, assignTrack, unassignTrack, markReferee,
-  getPlayers, detectEvents, getBallStats, getTrackingAt,
-  videoUrl, trackThumbnailUrl,
+  analyzeMatch, cancelAnalysis, getAnalysisProgress, getTracks, assignTrack, autoAssignTracks, unassignTrack, markReferee,
+  getPlayers, detectEvents, getBallStats, getTrackingBulk,
+  getAutoAssignProgress,
+  videoUrl,
 } from '../api'
 import {
   Play, Pause, SkipBack, SkipForward, Scan, Loader,
@@ -38,7 +39,6 @@ export default function MatchDetail() {
   const canvasRef = useRef(null)
   const containerRef = useRef(null)
   const rafRef = useRef(null)
-  const lastDrawnTs = useRef(null)
 
   const [match, setMatch] = useState(null)
   const [events, setEvents] = useState([])
@@ -55,14 +55,20 @@ export default function MatchDetail() {
   const [detecting, setDetecting] = useState(false)
   const [detectError, setDetectError] = useState('')
   const [ballCount, setBallCount] = useState(null)
+  const [autoAssigning, setAutoAssigning] = useState(false)
+  const [autoAssignProgress, setAutoAssignProgress] = useState(null)
+  const [autoAssignResult, setAutoAssignResult] = useState(null)
 
   // Overlay state
   const [overlayEnabled, setOverlayEnabled] = useState(true)
   const [assignMode, setAssignMode] = useState(false)
-  const [overlayBoxes, setOverlayBoxes] = useState([])
-  const [overlayTs, setOverlayTs] = useState(null)
+  const [overlayBoxes, setOverlayBoxes] = useState([]) // interpolated boxes for drawing
   const [assignPopup, setAssignPopup] = useState(null) // { x, y, trackId, bbox, player }
-  const overlayCache = useRef({}) // timestamp -> boxes
+
+  // Bulk tracking cache: pre-fetched chunks of ~10s
+  // Each chunk: { timestamps: number[], frames: {[ts]: boxes[]}, assignments: {}, referee_tracks: [], start, end }
+  const bulkCache = useRef([]) // array of loaded chunks
+  const pendingChunks = useRef(new Set()) // chunks currently being fetched (keyed by start time)
 
   // ── Data loading ─────────────────────────────────────────────────────
 
@@ -133,26 +139,172 @@ export default function MatchDetail() {
     }
   }
 
-  // ── Overlay drawing ──────────────────────────────────────────────────
+  // ── Overlay: bulk pre-fetch + client-side interpolation ─────────────
 
-  const fetchOverlayData = useCallback(async (t) => {
-    if (match?.status !== 'analyzed') return
-    // Round to nearest 0.1s to reduce API calls
-    const rounded = Math.round(t * 10) / 10
-    if (overlayCache.current[rounded]) {
-      setOverlayBoxes(overlayCache.current[rounded])
-      setOverlayTs(rounded)
-      return
+  const CHUNK_SIZE = 10 // seconds per chunk
+
+  // Find which chunk covers a given time
+  const findChunk = useCallback((t) => {
+    return bulkCache.current.find(c => t >= c.start && t <= c.end)
+  }, [])
+
+  // Binary search for the two surrounding timestamps in a sorted array
+  const findSurrounding = useCallback((timestamps, t) => {
+    if (!timestamps.length) return [null, null]
+    let lo = 0, hi = timestamps.length - 1
+    // If t is before first or after last
+    if (t <= timestamps[0]) return [timestamps[0], timestamps.length > 1 ? timestamps[1] : null]
+    if (t >= timestamps[hi]) return [timestamps[hi], null]
+    // Binary search
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (timestamps[mid] <= t) lo = mid + 1
+      else hi = mid - 1
     }
+    // hi is the last index <= t, lo is the first index > t
+    return [timestamps[hi], timestamps[lo] ?? null]
+  }, [])
+
+  // Interpolate boxes between two timestamps using cached chunk data
+  const getInterpolatedBoxes = useCallback((chunk, t) => {
+    if (!chunk || !chunk.timestamps.length) return []
+    const [tsBefore, tsAfter] = findSurrounding(chunk.timestamps, t)
+    if (tsBefore === null) return []
+
+    const beforeBoxes = chunk.frames[tsBefore] || []
+    const { assignments, referee_tracks } = chunk
+
+    // Annotate boxes with player/referee info
+    const annotate = (box) => {
+      const result = { ...box }
+      if (referee_tracks.includes(box.track_id)) {
+        result.is_referee = true
+      } else if (assignments[String(box.track_id)]) {
+        result.player = assignments[String(box.track_id)]
+      }
+      return result
+    }
+
+    if (tsAfter === null || tsAfter === tsBefore) {
+      return beforeBoxes.map(annotate)
+    }
+
+    const afterBoxes = chunk.frames[tsAfter] || []
+    const dt = tsAfter - tsBefore
+    const ratio = dt > 0 ? Math.max(0, Math.min(1, (t - tsBefore) / dt)) : 0
+
+    // Build lookup for after frame
+    const afterMap = {}
+    for (const box of afterBoxes) {
+      afterMap[box.track_id] = box
+    }
+
+    return beforeBoxes.map(box => {
+      const after = afterMap[box.track_id]
+      const annotated = annotate(box)
+      if (!after || ratio <= 0) return annotated
+
+      const [bx1, by1, bw1, bh1] = box.bbox
+      const [bx2, by2, bw2, bh2] = after.bbox
+      return {
+        ...annotated,
+        bbox: [
+          bx1 + (bx2 - bx1) * ratio,
+          by1 + (by2 - by1) * ratio,
+          bw1 + (bw2 - bw1) * ratio,
+          bh1 + (bh2 - bh1) * ratio,
+        ],
+      }
+    })
+  }, [findSurrounding])
+
+  // Pre-fetch a chunk of tracking data
+  const fetchChunk = useCallback(async (chunkStart) => {
+    if (match?.status !== 'analyzed') return
+    const key = chunkStart
+    if (pendingChunks.current.has(key)) return
+    // Already cached?
+    if (bulkCache.current.find(c => c.start === chunkStart)) return
+
+    pendingChunks.current.add(key)
     try {
-      const data = await getTrackingAt(id, rounded)
-      overlayCache.current[rounded] = data.boxes || []
-      setOverlayBoxes(data.boxes || [])
-      setOverlayTs(data.timestamp)
+      const chunkEnd = chunkStart + CHUNK_SIZE
+      const data = await getTrackingBulk(id, chunkStart, chunkEnd)
+      // Normalize frame keys: JSON "0.0" stays as string but JS parses
+      // timestamp 0.0 to number 0 — so frames["0.0"] != frames[0].
+      // Re-key frames dict using parseFloat so lookups by number work.
+      const normalizedFrames = {}
+      for (const [k, v] of Object.entries(data.frames)) {
+        normalizedFrames[parseFloat(k)] = v
+      }
+      data.frames = normalizedFrames
+
+      // Avoid duplicates
+      if (!bulkCache.current.find(c => c.start === chunkStart)) {
+        bulkCache.current.push(data)
+        // Keep cache bounded — max 6 chunks (~60s)
+        if (bulkCache.current.length > 6) {
+          bulkCache.current.shift()
+        }
+      }
+      // After loading, immediately update overlay for the current video time
+      const t = videoRef.current?.currentTime ?? 0
+      if (t >= chunkStart && t <= chunkStart + CHUNK_SIZE) {
+        const boxes = getInterpolatedBoxes(data, t)
+        setOverlayBoxes(boxes)
+      }
     } catch {
       // silently fail
+    } finally {
+      pendingChunks.current.delete(key)
     }
-  }, [id, match?.status])
+  }, [id, match?.status, getInterpolatedBoxes])
+
+  // Get boxes for a given time, triggering fetch if needed
+  const updateOverlay = useCallback((t) => {
+    if (match?.status !== 'analyzed' || !overlayEnabled) return
+
+    const chunkStart = Math.floor(t / CHUNK_SIZE) * CHUNK_SIZE
+    let chunk = findChunk(t)
+
+    if (!chunk) {
+      // Trigger fetch for current chunk
+      fetchChunk(chunkStart)
+      return
+    }
+
+    // Pre-fetch next chunk if we're within 2s of the end
+    if (t > chunk.end - 2) {
+      fetchChunk(chunkStart + CHUNK_SIZE)
+    }
+
+    const boxes = getInterpolatedBoxes(chunk, t)
+    setOverlayBoxes(boxes)
+  }, [match?.status, overlayEnabled, findChunk, fetchChunk, getInterpolatedBoxes])
+
+  // Invalidate bulk cache and refetch current chunk (after assignment changes)
+  const invalidateOverlayCache = useCallback(async () => {
+    bulkCache.current = []
+    pendingChunks.current.clear()
+    // Immediately refetch the current chunk so boxes reappear
+    if (match?.status === 'analyzed' && videoRef.current) {
+      const t = videoRef.current.currentTime || 0
+      const chunkStart = Math.floor(t / CHUNK_SIZE) * CHUNK_SIZE
+      try {
+        const data = await getTrackingBulk(id, chunkStart, chunkStart + CHUNK_SIZE)
+        // Normalize frame keys (same "0.0" vs 0 fix)
+        const normalizedFrames = {}
+        for (const [k, v] of Object.entries(data.frames)) {
+          normalizedFrames[parseFloat(k)] = v
+        }
+        data.frames = normalizedFrames
+        bulkCache.current.push(data)
+        // Re-compute boxes from the fresh data
+        const boxes = getInterpolatedBoxes(data, t)
+        setOverlayBoxes(boxes)
+      } catch { /* ignore */ }
+    }
+  }, [id, match?.status, getInterpolatedBoxes])
 
   const drawOverlay = useCallback(() => {
     const canvas = canvasRef.current
@@ -247,11 +399,18 @@ export default function MatchDetail() {
     }
   }, [overlayBoxes, overlayEnabled, assignMode, assignPopup])
 
-  // Fetch overlay data when time changes
+  // Pre-fetch initial chunk when analysis is ready
+  useEffect(() => {
+    if (match?.status !== 'analyzed' || !overlayEnabled) return
+    invalidateOverlayCache()
+    fetchChunk(0)
+  }, [match?.status, overlayEnabled])
+
+  // Update overlay when time changes (paused or scrubbing)
   useEffect(() => {
     if (!overlayEnabled || match?.status !== 'analyzed') return
-    fetchOverlayData(currentTime)
-  }, [Math.round(currentTime * 5) / 5, overlayEnabled, match?.status])
+    updateOverlay(currentTime)
+  }, [Math.round(currentTime * 20) / 20, overlayEnabled, match?.status])
 
   // Redraw overlay when data or state changes
   useEffect(() => {
@@ -264,6 +423,9 @@ export default function MatchDetail() {
     let active = true
     const loop = () => {
       if (!active) return
+      if (videoRef.current) {
+        updateOverlay(videoRef.current.currentTime)
+      }
       drawOverlay()
       rafRef.current = requestAnimationFrame(loop)
     }
@@ -272,7 +434,7 @@ export default function MatchDetail() {
       active = false
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
     }
-  }, [playing, overlayEnabled, drawOverlay])
+  }, [playing, overlayEnabled, drawOverlay, updateOverlay])
 
   // ── Canvas click handling (assign mode) ──────────────────────────────
 
@@ -318,31 +480,26 @@ export default function MatchDetail() {
 
   const handleMarkReferee = async (trackId) => {
     await markReferee(id, trackId)
-    overlayCache.current = {}
     setAssignPopup(null)
     const tr = await getTracks(id, 30)
     setTracks(tr)
-    fetchOverlayData(currentTime)
+    await invalidateOverlayCache()
   }
 
   const handleAssignFromOverlay = async (trackId, playerId) => {
     await assignTrack(id, { track_id: trackId, player_id: playerId })
-    // Clear cache so we refetch with new assignment data
-    overlayCache.current = {}
     setAssignPopup(null)
-    // Reload tracks + refresh overlay
     const tr = await getTracks(id, 30)
     setTracks(tr)
-    fetchOverlayData(currentTime)
+    await invalidateOverlayCache()
   }
 
   const handleUnassignFromOverlay = async (trackId) => {
     await unassignTrack(id, trackId)
-    overlayCache.current = {}
     setAssignPopup(null)
     const tr = await getTracks(id, 30)
     setTracks(tr)
-    fetchOverlayData(currentTime)
+    await invalidateOverlayCache()
   }
 
   // ── Event handlers ───────────────────────────────────────────────────
@@ -369,6 +526,54 @@ export default function MatchDetail() {
     await analyzeMatch(id)
     setMatch({ ...match, status: 'processing' })
   }
+
+  const handleCancelAnalysis = async () => {
+    try {
+      await cancelAnalysis(id)
+    } catch { /* ignore */ }
+  }
+
+  const handleAutoAssign = async () => {
+    setAutoAssigning(true)
+    setAutoAssignResult(null)
+    setAutoAssignProgress(null)
+    try {
+      await autoAssignTracks(id)
+    } catch (err) {
+      setAutoAssignResult({ error: err.message })
+      setAutoAssigning(false)
+    }
+  }
+
+  // Auto-assign progress polling
+  useEffect(() => {
+    if (!autoAssigning) return
+    const interval = setInterval(async () => {
+      try {
+        const p = await getAutoAssignProgress(id)
+        setAutoAssignProgress(p)
+        if (p.done || p.percent >= 100) {
+          clearInterval(interval)
+          if (p.error) {
+            setAutoAssignResult({ error: p.error })
+          } else {
+            setAutoAssignResult({
+              assigned_count: p.assigned_count ?? 0,
+              message: p.message || '',
+            })
+          }
+          const tr = await getTracks(id, 30)
+          setTracks(tr)
+          invalidateOverlayCache()
+          updateOverlay(currentTime)
+          setAutoAssigning(false)
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 800)
+    return () => clearInterval(interval)
+  }, [autoAssigning, id])
 
   const handleDetectEvents = async () => {
     setDetecting(true)
@@ -424,6 +629,13 @@ export default function MatchDetail() {
                 />
               </div>
             </div>
+            <button
+              onClick={handleCancelAnalysis}
+              className="shrink-0 p-1.5 rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
+              title="Annuler l'analyse"
+            >
+              <X size={16} />
+            </button>
           </div>
         ) : (
           <div className="flex items-center gap-2">
@@ -455,8 +667,8 @@ export default function MatchDetail() {
                 muted
                 onTimeUpdate={handleTimeUpdate}
                 onPlay={() => setPlaying(true)}
-                onPause={() => { setPlaying(false); fetchOverlayData(videoRef.current?.currentTime || 0) }}
-                onSeeked={() => fetchOverlayData(videoRef.current?.currentTime || 0)}
+                onPause={() => { setPlaying(false); updateOverlay(videoRef.current?.currentTime || 0) }}
+                onSeeked={() => updateOverlay(videoRef.current?.currentTime || 0)}
               />
               {/* Overlay canvas */}
               {match.status === 'analyzed' && overlayEnabled && (
@@ -742,6 +954,54 @@ export default function MatchDetail() {
                     >
                       <MousePointer size={15} /> Commencer l'identification des joueurs
                     </button>
+                  )}
+
+                  {/* Auto-assign button + progress */}
+                  {assignedCount > 0 && !autoAssigning && (
+                    <button
+                      onClick={handleAutoAssign}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-xl text-blue-300 text-sm font-medium transition-colors"
+                    >
+                      <Zap size={15} /> Auto-assigner par apparence
+                    </button>
+                  )}
+                  {autoAssigning && autoAssignProgress && (
+                    <div className="space-y-2 p-3 bg-slate-800/60 rounded-xl">
+                      <div className="flex items-center gap-2">
+                        <Loader size={14} className="animate-spin text-blue-400 shrink-0" />
+                        <span className="text-xs text-blue-300 flex-1 truncate">
+                          {autoAssignProgress.phase || 'Démarrage...'}
+                        </span>
+                        <span className="text-xs font-mono text-blue-400">
+                          {autoAssignProgress.percent || 0}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-gradient-to-r from-blue-500 to-blue-400 h-full rounded-full transition-all duration-500"
+                          style={{ width: `${autoAssignProgress.percent || 0}%` }}
+                        />
+                      </div>
+                      <p className="text-[10px] text-gray-600">
+                        {autoAssignProgress.current || 0} / {autoAssignProgress.total || '?'} tracks
+                      </p>
+                    </div>
+                  )}
+                  {autoAssigning && !autoAssignProgress && (
+                    <div className="flex items-center justify-center gap-2 p-3 bg-slate-800/60 rounded-xl">
+                      <Loader size={14} className="animate-spin text-blue-400" />
+                      <span className="text-xs text-blue-300">Démarrage de l'analyse...</span>
+                    </div>
+                  )}
+                  {autoAssignResult && (
+                    <div className={`text-xs px-3 py-2 rounded-lg ${autoAssignResult.error ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'}`}>
+                      {autoAssignResult.error
+                        ? autoAssignResult.error
+                        : autoAssignResult.message
+                          ? autoAssignResult.message
+                          : `${autoAssignResult.assigned_count} tracks auto-assignés`
+                      }
+                    </div>
                   )}
 
                   {/* List of assigned players */}
