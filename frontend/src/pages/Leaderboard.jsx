@@ -8,7 +8,6 @@ const CATEGORIES = [
   { value: 'assist', label: 'Passes dé' },
   { value: 'shot', label: 'Tirs' },
   { value: 'interception', label: 'Interceptions' },
-  { value: 'save', label: 'Arrêts' },
   { value: 'dribble', label: 'Dribbles' },
   { value: 'key_pass', label: 'Passes clés' },
   { value: 'pass', label: 'Passes' },

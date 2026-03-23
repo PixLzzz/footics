@@ -7,8 +7,7 @@ export default function MatchUpload() {
   const navigate = useNavigate()
   const [teams, setTeams] = useState([])
   const [title, setTitle] = useState('')
-  const [teamHomeId, setTeamHomeId] = useState('')
-  const [teamAwayId, setTeamAwayId] = useState('')
+  const [teamId, setTeamId] = useState('')
   const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
@@ -25,8 +24,7 @@ export default function MatchUpload() {
     const fd = new FormData()
     fd.append('title', title)
     fd.append('video', file)
-    if (teamHomeId) fd.append('team_home_id', teamHomeId)
-    if (teamAwayId) fd.append('team_away_id', teamAwayId)
+    if (teamId) fd.append('team_id', teamId)
 
     try {
       const result = await uploadMatch(fd)
@@ -63,33 +61,21 @@ export default function MatchUpload() {
           />
         </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="label">Equipe domicile</label>
-            <select
-              className="input"
-              value={teamHomeId}
-              onChange={(e) => setTeamHomeId(e.target.value)}
-            >
-              <option value="">-- Aucune --</option>
-              {teams.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="label">Equipe extérieur</label>
-            <select
-              className="input"
-              value={teamAwayId}
-              onChange={(e) => setTeamAwayId(e.target.value)}
-            >
-              <option value="">-- Aucune --</option>
-              {teams.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
-          </div>
+        <div>
+          <label className="label">Equipe analysée</label>
+          <select
+            className="input"
+            value={teamId}
+            onChange={(e) => setTeamId(e.target.value)}
+          >
+            <option value="">-- Aucune --</option>
+            {teams.map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
+          <p className="text-xs text-gray-600 mt-1">
+            Seuls les joueurs de cette équipe seront trackés et analysés
+          </p>
         </div>
 
         <div>

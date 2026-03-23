@@ -1,7 +1,8 @@
 """
 Automatic event detection from player tracking + ball tracking data.
 
-Detects: passes, interceptions, shots, goals, assists, key passes, dribbles, saves.
+Single-team analysis: detects events for the tracked team only.
+Detects: passes, interceptions, shots, goals, assists, key passes, dribbles.
 
 Pipeline:
   1. Load & index tracking data
@@ -9,7 +10,7 @@ Pipeline:
   3. Compute ball velocity between frames
   4. Derive events from possession changes + ball trajectory
   5. Second pass: confirm goals via ball disappearance
-  6. Post-processing: remove shot→goal duplicates, detect saves, assists, key passes
+  6. Post-processing: remove shot→goal duplicates, detect assists & key passes
 """
 
 import logging
@@ -49,15 +50,12 @@ DRIBBLE_MIN_DURATION = 1.5       # Min seconds holding ball while moving
 ASSIST_WINDOW = 15.0             # Max seconds between pass and goal for assist
 KEY_PASS_WINDOW = 10.0           # Max seconds between pass and shot for key pass
 
-# Saves
-SAVE_WINDOW = 3.0                # Seconds after shot to check if it was saved
-
 
 # ── Main entry point ─────────────────────────────────────────────────────────
 
-def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -> list[dict]:
+def detect_events(match_id: int, db: Session, attacks_right: bool = True) -> list[dict]:
     """
-    Analyze tracking + ball data to auto-detect match events.
+    Analyze tracking + ball data to auto-detect match events for the tracked team.
 
     Returns list of detected events as dicts.
     """
@@ -82,11 +80,8 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
 
     logger.info(f"Match {match_id}: analyzing {len(timestamps)} frames with ball+player data")
 
-    home_goal_x = 1.0 if home_attacks_right else 0.0
-    away_goal_x = 0.0 if home_attacks_right else 1.0
-
-    def target_goal_x(team_id):
-        return home_goal_x if team_id == match.team_home_id else away_goal_x
+    # Team attacks right → goal is at x=1.0; attacks left → goal at x=0.0
+    target_goal_x = 1.0 if attacks_right else 0.0
 
     # ── Phase 1: Possession timeline with hysteresis ──────────────────────
     possession_tl = _build_possession_timeline(
@@ -102,8 +97,7 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
     # ── Phase 4: Derive events from timeline ──────────────────────────────
     events = []
     last_events = {}  # (event_type, player_id) → last timestamp
-    pass_chain = []   # [(t, player_id, team_id, ball_x, ball_y)] for assists/key_pass
-    shots_pending = []  # [(t, player_id, team_id)] for save detection
+    pass_chain = []   # [(t, player_id, ball_x, ball_y)] for assists/key_pass
 
     prev = None
     for entry in possession_tl:
@@ -117,9 +111,7 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
 
         info = assignments[track_id]
         pid = info["player_id"]
-        tid = info["team_id"]
-        tgx = target_goal_x(tid)
-        dist_to_goal = abs(bx - tgx)
+        dist_to_goal = abs(bx - target_goal_x)
 
         # ── Possession change events ──────────────────────────────────
         if (prev and prev["possessor"] is not None
@@ -131,25 +123,23 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
             if poss_dur >= POSSESSION_MIN_DURATION:
                 ball_travel = _dist(bx, by, prev["bx"], prev["by"])
 
-                if old["team_id"] == tid:
-                    # Same team → PASS (only if ball actually moved)
-                    if ball_travel >= PASS_MIN_BALL_TRAVEL:
-                        added = _add_event(events, last_events, match_id,
-                                           old["player_id"], "pass", t, EVENT_COOLDOWN,
-                                           x=bx, y=by)
-                        if added:
-                            pass_chain.append((t, old["player_id"], old["team_id"], bx, by))
-                else:
-                    # Different team → INTERCEPTION
-                    _add_event(events, last_events, match_id,
-                               pid, "interception", t, EVENT_COOLDOWN,
-                               x=bx, y=by)
-                    pass_chain.clear()  # reset on turnover
+                # Both players are from the same team → PASS
+                if ball_travel >= PASS_MIN_BALL_TRAVEL:
+                    added = _add_event(events, last_events, match_id,
+                                       old["player_id"], "pass", t, EVENT_COOLDOWN,
+                                       x=bx, y=by)
+                    if added:
+                        pass_chain.append((t, old["player_id"], bx, by))
+            else:
+                # Very short possession by someone else then back → possible INTERCEPTION
+                # (ball was briefly contested, current player won it back)
+                _add_event(events, last_events, match_id,
+                           pid, "interception", t, EVENT_COOLDOWN,
+                           x=bx, y=by)
 
         # ── Shot detection (ball moving fast toward goal) ─────────────
         if GOAL_ZONE_X <= dist_to_goal < SHOT_ZONE_X:
             speed = ball_velocity.get(t, 0)
-            # Require minimum speed, or lower threshold if very close to goal
             speed_threshold = SHOT_MIN_SPEED
             if dist_to_goal < SHOT_ZONE_X * 0.4:
                 speed_threshold *= 0.6  # easier to detect close shots
@@ -159,10 +149,9 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
                                    pid, "shot", t, cooldown=3.0,
                                    x=bx, y=by)
                 if added:
-                    shots_pending.append((t, pid, tid))
-                    # Key pass: last pass from same team that led to this shot
-                    for pt, pp_id, pt_id, px, py in reversed(pass_chain):
-                        if pt_id == tid and pp_id != pid and t - pt < KEY_PASS_WINDOW:
+                    # Key pass: last pass that led to this shot
+                    for pt, pp_id, px, py in reversed(pass_chain):
+                        if pp_id != pid and t - pt < KEY_PASS_WINDOW:
                             _add_event(events, last_events, match_id,
                                        pp_id, "key_pass", pt, cooldown=5.0,
                                        x=px, y=py)
@@ -181,18 +170,17 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
     # ── Phase 5: Goal confirmation (ball disappearance after goal zone) ───
     goal_candidates = _detect_goal_candidates(
         all_player_ts, player_by_ts, ball_by_ts, ball_gaps,
-        assignments, match, home_goal_x, away_goal_x,
-        possession_tl, timestamps
+        assignments, target_goal_x, possession_tl, timestamps
     )
 
-    for gt, gpid, gtid, gx, gy in goal_candidates:
+    for gt, gpid, gx, gy in goal_candidates:
         added = _add_event(events, last_events, match_id,
                            gpid, "goal", gt, cooldown=10.0,
                            x=gx, y=gy)
         if added:
-            # Assist: last pass from same team before this goal
-            for pt, pp_id, pt_id, px, py in reversed(pass_chain):
-                if pt_id == gtid and pp_id != gpid and gt - pt < ASSIST_WINDOW:
+            # Assist: last pass before this goal
+            for pt, pp_id, px, py in reversed(pass_chain):
+                if pp_id != gpid and gt - pt < ASSIST_WINDOW:
                     _add_event(events, last_events, match_id,
                                pp_id, "assist", pt, cooldown=10.0,
                                x=px, y=py)
@@ -211,26 +199,6 @@ def detect_events(match_id: int, db: Session, home_attacks_right: bool = True) -
             and any(abs(e["timestamp_seconds"] - gt) < 5 for gt in goal_times)
         )
     ]
-
-    # Save detection: shots that didn't become goals
-    for st, sp_id, stid in shots_pending:
-        if any(abs(st - gt) < SAVE_WINDOW * 2 for gt in goal_times):
-            continue  # this shot led to a goal, no save
-
-        # Find nearest defending player to their own goal at shot time
-        defending_tid = (match.team_away_id if stid == match.team_home_id
-                         else match.team_home_id)
-        defending_goal_x = (away_goal_x if stid == match.team_home_id
-                            else home_goal_x)
-
-        closest_t = min(timestamps, key=lambda x: abs(x - st)) if timestamps else None
-        if closest_t and closest_t in player_by_ts:
-            keeper_pid = _find_nearest_defender_to_goal(
-                player_by_ts[closest_t], assignments, defending_tid, defending_goal_x
-            )
-            if keeper_pid:
-                _add_event(events, last_events, match_id,
-                           keeper_pid, "save", round(st + 0.5, 2), cooldown=3.0)
 
     # ── Sort & persist ────────────────────────────────────────────────────
     events.sort(key=lambda e: e["timestamp_seconds"])
@@ -305,25 +273,20 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
     """
     Build frame-by-frame possession with hysteresis to prevent flickering.
 
-    Hysteresis: a new player must be closest to the ball for POSSESSION_HYSTERESIS
-    consecutive frames before possession actually switches. The current possessor
-    also gets a small distance bonus (POSSESSION_STICKY_BONUS).
-
     Returns list of dicts with:
       t, bx, by, possessor (track_id or None), poss_duration, player_travel
     """
     timeline = []
     current_possessor = None
     possession_since = None
-    possession_start_pos = None  # (px, py) of player when they got possession
-    challenger = None            # track_id of challenger
-    challenger_streak = 0        # consecutive frames challenger is closest
+    possession_start_pos = None
+    challenger = None
+    challenger_streak = 0
 
     for t in timestamps:
         bx, by = ball_by_ts[t]
         players = player_by_ts.get(t, [])
 
-        # Find nearest assigned player, with sticky bonus for current possessor
         nearest_track = None
         nearest_dist = float("inf")
         current_poss_dist = float("inf")
@@ -334,7 +297,6 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
                 continue
             d = _dist(p["cx"], p["foot_y"], bx, by)
 
-            # Apply sticky bonus: current possessor is "closer" than they really are
             effective_d = d
             if tid == current_possessor:
                 effective_d = max(0, d - POSSESSION_STICKY_BONUS)
@@ -344,11 +306,9 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
                 nearest_dist = effective_d
                 nearest_track = tid
 
-        # Nobody close enough
         if nearest_track is None or nearest_dist > POSSESSION_DIST:
-            # Keep current possessor if they're still reasonably close
             if current_possessor is not None and current_poss_dist <= POSSESSION_DIST * 1.5:
-                pass  # retain possession
+                pass
             else:
                 current_possessor = None
                 possession_since = None
@@ -365,7 +325,6 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
             })
             continue
 
-        # Hysteresis: don't switch immediately
         if nearest_track != current_possessor:
             if nearest_track == challenger:
                 challenger_streak += 1
@@ -374,10 +333,8 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
                 challenger_streak = 1
 
             if challenger_streak >= POSSESSION_HYSTERESIS or current_possessor is None:
-                # Switch possession
                 current_possessor = nearest_track
                 possession_since = t
-                # Find player position for travel tracking
                 for p in players:
                     if p["track_id"] == nearest_track:
                         possession_start_pos = (p["cx"], p["cy"])
@@ -385,11 +342,9 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
                 challenger = None
                 challenger_streak = 0
         else:
-            # Same possessor, reset challenger
             challenger = None
             challenger_streak = 0
 
-        # Compute possession duration and player travel
         poss_dur = (t - possession_since) if possession_since else 0
         player_travel = 0
         if possession_start_pos and current_possessor:
@@ -423,7 +378,7 @@ def _compute_ball_velocity(timestamps, ball_by_ts):
         x1, y1 = ball_by_ts[t_prev]
         x2, y2 = ball_by_ts[t_curr]
         dist = _dist(x1, y1, x2, y2)
-        velocity[t_curr] = dist / dt  # normalized units per second
+        velocity[t_curr] = dist / dt
     if timestamps:
         velocity[timestamps[0]] = 0
     return velocity
@@ -449,53 +404,35 @@ def _build_ball_gaps(all_player_ts, ball_ts_set):
 # ── Goal detection (ball disappearance confirmation) ──────────────────────────
 
 def _detect_goal_candidates(all_player_ts, player_by_ts, ball_by_ts, ball_gaps,
-                            assignments, match, home_goal_x, away_goal_x,
-                            possession_tl, timestamps):
+                            assignments, target_goal_x, possession_tl, timestamps):
     """
     Detect goals by finding frames where:
-    1. Ball enters goal zone (correct side for the possessing team)
-    2. Ball Y is within goal post range (not on sideline)
+    1. Ball enters goal zone (correct side for the team)
+    2. Ball Y is within goal post range
     3. Ball then disappears for GOAL_DISAPPEAR_MIN+ seconds
-
-    Uses the possession timeline from the main pass to know who had the ball.
     """
-    # Build a quick lookup: timestamp → possessor info from the timeline
     poss_at_t = {}
     for entry in possession_tl:
         if entry["possessor"] and entry["possessor"] in assignments:
             info = assignments[entry["possessor"]]
-            poss_at_t[entry["t"]] = (info["player_id"], info["team_id"])
+            poss_at_t[entry["t"]] = info["player_id"]
 
     ball_ts_set = set(ball_by_ts.keys())
     candidates = []
-    candidate = None  # (t, player_id, team_id, ball_x, ball_y)
+    candidate = None  # (t, player_id, ball_x, ball_y)
 
     for t in all_player_ts:
         if t in ball_ts_set:
             bx, by = ball_by_ts[t]
 
-            in_home_goal = abs(bx - home_goal_x) < GOAL_ZONE_X
-            in_away_goal = abs(bx - away_goal_x) < GOAL_ZONE_X
-
-            # Ball Y must be in plausible goal range (not on sideline)
+            in_goal_zone = abs(bx - target_goal_x) < GOAL_ZONE_X
             y_in_goal = GOAL_Y_MIN <= by <= GOAL_Y_MAX
 
-            if (in_home_goal or in_away_goal) and y_in_goal:
-                # Find last known possessor near this timestamp
-                possessor_info = _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0)
-                if possessor_info:
-                    pid, tid = possessor_info
-                    # Verify possessor's team attacks this goal
-                    if tid == match.team_home_id:
-                        attacks_x = home_goal_x
-                    else:
-                        attacks_x = away_goal_x
-                    correct_goal = ((in_home_goal and attacks_x == home_goal_x) or
-                                    (in_away_goal and attacks_x == away_goal_x))
-                    if correct_goal:
-                        candidate = (t, pid, tid, bx, by)
+            if in_goal_zone and y_in_goal:
+                possessor_pid = _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0)
+                if possessor_pid:
+                    candidate = (t, possessor_pid, bx, by)
         else:
-            # Ball not detected — confirm candidate if gap is long enough
             if candidate is not None:
                 gap = ball_gaps.get(t, 0)
                 if gap >= GOAL_DISAPPEAR_MIN:
@@ -506,10 +443,9 @@ def _detect_goal_candidates(all_player_ts, player_by_ts, ball_by_ts, ball_gaps,
 
 
 def _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0):
-    """Find the possessor at or just before timestamp t (within window seconds)."""
+    """Find the possessor player_id at or just before timestamp t (within window seconds)."""
     if t in poss_at_t:
         return poss_at_t[t]
-    # Search backwards through nearby timestamps
     for ts in reversed(timestamps):
         if ts > t:
             continue
@@ -518,29 +454,6 @@ def _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0):
         if ts in poss_at_t:
             return poss_at_t[ts]
     return None
-
-
-# ── Save detection helper ─────────────────────────────────────────────────────
-
-def _find_nearest_defender_to_goal(players, assignments, defending_team_id, goal_x):
-    """Find the defending team's player closest to their own goal. Returns player_id or None."""
-    best_pid = None
-    best_dist = float("inf")
-    for p in players:
-        tid = p["track_id"]
-        if tid not in assignments:
-            continue
-        info = assignments[tid]
-        if info["team_id"] != defending_team_id:
-            continue
-        d = abs(p["cx"] - goal_x)
-        if d < best_dist:
-            best_dist = d
-            best_pid = info["player_id"]
-    # Only count as save if someone is actually near the goal (within 15% of pitch)
-    if best_dist > 0.15:
-        return None
-    return best_pid
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────

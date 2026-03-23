@@ -39,10 +39,10 @@ export const uploadMatch = (formDataObj) =>
 // Analysis
 export const analyzeMatch = (id) => request(`/matches/${id}/analyze`, { method: 'POST' });
 export const getAnalysisProgress = (id) => request(`/matches/${id}/analysis-progress`);
-export const detectEvents = (matchId, homeAttacksRight) =>
+export const detectEvents = (matchId, attacksRight) =>
   request(`/matches/${matchId}/detect-events`, {
     method: 'POST',
-    body: formData({ home_attacks_right: homeAttacksRight }),
+    body: formData({ attacks_right: attacksRight }),
   });
 export const getBallStats = (id) => request(`/matches/${id}/ball-stats`);
 export const getTracking = (id, start = 0, end = null) =>

@@ -86,11 +86,10 @@ export default function Dashboard() {
                     <span className="flex items-center gap-1">
                       <Clock size={11} /> {formatDuration(m.duration_seconds)}
                     </span>
-                    {m.team_home && m.team_away && (
-                      <span>
-                        <span style={{ color: m.team_home.color }}>{m.team_home.name}</span>
-                        {' vs '}
-                        <span style={{ color: m.team_away.color }}>{m.team_away.name}</span>
+                    {m.team && (
+                      <span className="flex items-center gap-1">
+                        <span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: m.team.color }} />
+                        <span style={{ color: m.team.color }}>{m.team.name}</span>
                       </span>
                     )}
                     {m.event_count > 0 && (

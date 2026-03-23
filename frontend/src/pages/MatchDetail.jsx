@@ -22,7 +22,6 @@ const EVENT_TYPES = [
   { value: 'interception', label: 'Interception', emoji: '🛡️' },
   { value: 'tackle', label: 'Tacle', emoji: '🦶' },
   { value: 'foul', label: 'Faute', emoji: '🟨' },
-  { value: 'save', label: 'Arrêt', emoji: '🧤' },
   { value: 'dribble', label: 'Dribble', emoji: '✨' },
 ]
 
@@ -52,7 +51,7 @@ export default function MatchDetail() {
   const [selectedPlayer, setSelectedPlayer] = useState('')
   const [selectedEvent, setSelectedEvent] = useState('goal')
   const [progress, setProgress] = useState(null)
-  const [homeAttacksRight, setHomeAttacksRight] = useState(true)
+  const [attacksRight, setAttacksRight] = useState(true)
   const [detecting, setDetecting] = useState(false)
   const [detectError, setDetectError] = useState('')
   const [ballCount, setBallCount] = useState(null)
@@ -72,8 +71,9 @@ export default function MatchDetail() {
     setMatch(m)
     const ev = await getEvents(id)
     setEvents(ev)
-    const p = await getPlayers()
-    setPlayers(p)
+    const allPlayers = await getPlayers()
+    // Filter to only the match's team if set
+    setPlayers(m.team ? allPlayers.filter(p => p.team_id === m.team.id) : allPlayers)
     if (m.status === 'analyzed') {
       const tr = await getTracks(id, 30)
       setTracks(tr)
@@ -374,7 +374,7 @@ export default function MatchDetail() {
     setDetecting(true)
     setDetectError('')
     try {
-      await detectEvents(id, homeAttacksRight)
+      await detectEvents(id, attacksRight)
       const ev = await getEvents(id)
       setEvents(ev)
       setTab('events')
@@ -403,8 +403,8 @@ export default function MatchDetail() {
         <div>
           <h1 className="text-2xl font-bold">{match.title}</h1>
           <p className="text-gray-500 text-sm">
-            {match.team_home && match.team_away
-              ? <>{match.team_home.name} vs {match.team_away.name} &middot; </>
+            {match.team
+              ? <><span style={{ color: match.team.color }}>{match.team.name}</span> &middot; </>
               : null}
             {formatTime(match.duration_seconds)}
           </p>
@@ -546,7 +546,7 @@ export default function MatchDetail() {
                           <option value="">-- Qui est ce joueur ? --</option>
                           {players.map((p) => (
                             <option key={p.id} value={p.id}>
-                              {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name} ({p.team_name})
+                              {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
                             </option>
                           ))}
                         </select>
@@ -630,7 +630,7 @@ export default function MatchDetail() {
                 <option value="">-- Joueur --</option>
                 {players.map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name} ({p.team_name})
+                    {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
                   </option>
                 ))}
               </select>
@@ -847,27 +847,27 @@ export default function MatchDetail() {
                   )}
 
                   <div>
-                    <p className="text-sm font-medium mb-2">Direction d'attaque</p>
+                    <p className="text-sm font-medium mb-2">Direction d'attaque de l'équipe</p>
                     <div className="flex gap-2">
                       <button
-                        onClick={() => setHomeAttacksRight(true)}
+                        onClick={() => setAttacksRight(true)}
                         className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-sm transition-all ${
-                          homeAttacksRight
+                          attacksRight
                             ? 'bg-blue-600/20 border border-blue-500/40 text-blue-300'
                             : 'bg-slate-800/60 text-gray-500 hover:bg-slate-800'
                         }`}
                       >
-                        {match.team_home?.name || 'Domicile'} <ArrowRight size={14} />
+                        {match.team?.name || 'Equipe'} <ArrowRight size={14} />
                       </button>
                       <button
-                        onClick={() => setHomeAttacksRight(false)}
+                        onClick={() => setAttacksRight(false)}
                         className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-sm transition-all ${
-                          !homeAttacksRight
+                          !attacksRight
                             ? 'bg-blue-600/20 border border-blue-500/40 text-blue-300'
                             : 'bg-slate-800/60 text-gray-500 hover:bg-slate-800'
                         }`}
                       >
-                        <ArrowLeft size={14} /> {match.team_home?.name || 'Domicile'}
+                        <ArrowLeft size={14} /> {match.team?.name || 'Equipe'}
                       </button>
                     </div>
                   </div>

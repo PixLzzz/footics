@@ -29,6 +29,23 @@ except ImportError:
 # Create tables
 Base.metadata.create_all(bind=engine)
 
+# ── DB migration: team_home_id/team_away_id → team_id ─────────────────────
+def _migrate_matches_single_team():
+    """Migrate old matches table (home/away) to single team_id."""
+    from sqlalchemy import text, inspect
+    with engine.connect() as conn:
+        inspector = inspect(engine)
+        columns = [c["name"] for c in inspector.get_columns("matches")]
+        if "team_home_id" in columns and "team_id" not in columns:
+            conn.execute(text("ALTER TABLE matches ADD COLUMN team_id INTEGER REFERENCES teams(id)"))
+            conn.execute(text("UPDATE matches SET team_id = team_home_id"))
+            conn.commit()
+
+try:
+    _migrate_matches_single_team()
+except Exception:
+    pass  # fresh DB or already migrated
+
 # Ensure directories exist
 UPLOAD_DIR = Path("./data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -177,8 +194,7 @@ def delete_player(player_id: int, db: Session = Depends(get_db)):
 def upload_match(
     title: str = Form(...),
     video: UploadFile = File(...),
-    team_home_id: Optional[int] = Form(None),
-    team_away_id: Optional[int] = Form(None),
+    team_id: Optional[int] = Form(None),
     db: Session = Depends(get_db),
 ):
     ext = Path(video.filename).suffix.lower()
@@ -203,8 +219,7 @@ def upload_match(
         title=title,
         video_path=str(filepath),
         video_filename=video.filename,
-        team_home_id=team_home_id if team_home_id else None,
-        team_away_id=team_away_id if team_away_id else None,
+        team_id=team_id if team_id else None,
         fps=info["fps"],
         duration_seconds=info["duration_seconds"],
         width=info["width"],
@@ -224,8 +239,7 @@ def list_matches(db: Session = Depends(get_db)):
             "id": m.id, "title": m.title, "date": m.date.isoformat(),
             "status": m.status, "duration_seconds": m.duration_seconds,
             "video_filename": m.video_filename,
-            "team_home": {"id": m.team_home.id, "name": m.team_home.name, "color": m.team_home.color} if m.team_home else None,
-            "team_away": {"id": m.team_away.id, "name": m.team_away.name, "color": m.team_away.color} if m.team_away else None,
+            "team": {"id": m.team.id, "name": m.team.name, "color": m.team.color} if m.team else None,
             "event_count": len(m.events),
         }
         for m in matches
@@ -242,8 +256,7 @@ def get_match(match_id: int, db: Session = Depends(get_db)):
         "status": match.status, "duration_seconds": match.duration_seconds,
         "fps": match.fps, "width": match.width, "height": match.height,
         "video_filename": match.video_filename,
-        "team_home": {"id": match.team_home.id, "name": match.team_home.name, "color": match.team_home.color} if match.team_home else None,
-        "team_away": {"id": match.team_away.id, "name": match.team_away.name, "color": match.team_away.color} if match.team_away else None,
+        "team": {"id": match.team.id, "name": match.team.name, "color": match.team.color} if match.team else None,
     }
 
 
@@ -328,7 +341,7 @@ def get_analysis_progress(match_id: int, db: Session = Depends(get_db)):
 @app.post("/api/matches/{match_id}/detect-events")
 def auto_detect_events(
     match_id: int,
-    home_attacks_right: bool = Form(True),
+    attacks_right: bool = Form(True),
     db: Session = Depends(get_db),
 ):
     """Auto-detect match events from tracking + ball data."""
@@ -349,7 +362,7 @@ def auto_detect_events(
     if assign_count == 0:
         raise HTTPException(400, "Assignez d'abord les joueurs aux tracks détectés.")
 
-    events = detect_events(match_id, db, home_attacks_right=home_attacks_right)
+    events = detect_events(match_id, db, attacks_right=attacks_right)
     return {
         "count": len(events),
         "events": [

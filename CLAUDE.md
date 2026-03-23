@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Footics is a web application for analyzing five-a-side football (futsal) matches. Users upload match videos, the system detects and tracks players using YOLO, and users can log match events (goals, assists, tackles, etc.) to build per-player statistics.
+Footics is a web application for analyzing five-a-side football (futsal) matches. Users upload match videos, select **one team** to analyze, the system detects and tracks players using YOLO, and users can log match events (goals, assists, shots, dribbles, etc.) to build per-player statistics. The app focuses on single-team analysis — only the selected team's players are tracked, assigned, and included in stats.
 
 ## Architecture
 

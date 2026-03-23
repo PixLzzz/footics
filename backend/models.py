@@ -15,7 +15,6 @@ class EventType(str, enum.Enum):
     INTERCEPTION = "interception"
     TACKLE = "tackle"
     FOUL = "foul"
-    SAVE = "save"
     DRIBBLE = "dribble"
 
 
@@ -58,8 +57,7 @@ class Match(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
     date = Column(DateTime, default=datetime.utcnow)
-    team_home_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
-    team_away_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
     video_path = Column(String, nullable=False)
     video_filename = Column(String, nullable=False)
     duration_seconds = Column(Float, default=0)
@@ -69,8 +67,7 @@ class Match(Base):
     status = Column(String, default=MatchStatus.UPLOADED)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    team_home = relationship("Team", foreign_keys=[team_home_id])
-    team_away = relationship("Team", foreign_keys=[team_away_id])
+    team = relationship("Team", foreign_keys=[team_id])
     events = relationship("MatchEvent", back_populates="match", cascade="all, delete-orphan")
     tracking_data = relationship("TrackingFrame", back_populates="match", cascade="all, delete-orphan")
     ball_data = relationship("BallFrame", back_populates="match", cascade="all, delete-orphan")
