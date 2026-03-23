@@ -1,0 +1,11 @@
+services:
+  footics:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - footics-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  footics-data:

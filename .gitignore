@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+data/
+backend/static/
+backend/data/
+backend/venv/
+backend/.venv/
+*.db
+*.pt
+.claude/

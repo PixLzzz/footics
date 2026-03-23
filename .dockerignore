@@ -1,0 +1,8 @@
+node_modules
+__pycache__
+*.pyc
+.git
+.env
+data/
+backend/static/
+backend/data/

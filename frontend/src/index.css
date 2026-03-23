@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply antialiased;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    @apply w-1.5;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-blue-900/40 rounded-full hover:bg-blue-800/60;
+  }
+
+  /* Selection */
+  ::selection {
+    @apply bg-blue-600/40;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-150
+           disabled:opacity-40 disabled:cursor-not-allowed
+           active:scale-[0.97];
+  }
+  .btn-primary {
+    @apply btn bg-blue-600 hover:bg-blue-700 text-white shadow-lg shadow-blue-900/20;
+  }
+  .btn-secondary {
+    @apply btn bg-slate-700/80 hover:bg-slate-600 text-gray-100;
+  }
+  .btn-danger {
+    @apply btn bg-red-600/80 hover:bg-red-600 text-white;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-sm;
+  }
+  .card {
+    @apply bg-slate-900/70 border border-blue-900/30 rounded-2xl p-6
+           backdrop-blur-sm;
+  }
+  .input {
+    @apply w-full px-3 py-2 bg-slate-800/80 border border-blue-900/40 rounded-lg
+           text-gray-100 placeholder-gray-600
+           focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50
+           transition-all duration-150;
+  }
+  .label {
+    @apply block text-sm font-medium text-blue-300/60 mb-1.5;
+  }
+
+  /* Modal slide-in */
+  .animate-in {
+    animation: slideIn 0.15s ease-out;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+}
