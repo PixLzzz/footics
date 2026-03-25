@@ -68,8 +68,26 @@ export const correctIdentities = (matchId) =>
   request(`/matches/${matchId}/correct-identities`, { method: 'POST' });
 export const getCorrectionProgress = (matchId) =>
   request(`/matches/${matchId}/correction-progress`);
+export const runFullPipeline = (matchId) =>
+  request(`/matches/${matchId}/full-pipeline`, { method: 'POST' });
+export const getPipelineProgress = (matchId) =>
+  request(`/matches/${matchId}/pipeline-progress`);
 export const getTrackingAt = (matchId, t) => request(`/matches/${matchId}/tracking-at?t=${t}`);
 export const getTeamLabels = (matchId) => request(`/matches/${matchId}/team-labels`);
+
+// Field Mapping (Bird's-Eye View)
+export const getFieldMapping = (matchId) => request(`/matches/${matchId}/field-mapping`);
+export const setFieldMapping = (matchId, corners, fieldLength = 40, fieldWidth = 20) =>
+  request(`/matches/${matchId}/field-mapping`, {
+    method: 'POST',
+    body: formData({ corners: JSON.stringify(corners), field_length: fieldLength, field_width: fieldWidth }),
+  });
+export const minimapUrl = (matchId, t) => `${BASE}/matches/${matchId}/minimap?t=${t}`;
+export const getFieldPositions = (matchId, t) => request(`/matches/${matchId}/field-positions?t=${t}`);
+
+// Track Confidence & Export
+export const getTrackConfidence = (matchId) => request(`/matches/${matchId}/track-confidence`);
+export const exportMatchData = (matchId) => request(`/matches/${matchId}/export`);
 
 // Events
 export const getEvents = (matchId) => request(`/matches/${matchId}/events`);

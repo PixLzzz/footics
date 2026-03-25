@@ -46,6 +46,20 @@ try:
 except Exception:
     pass  # fresh DB or already migrated
 
+def _migrate_field_homography():
+    """Add field_homography column to matches if missing."""
+    from sqlalchemy import text, inspect
+    with engine.connect() as conn:
+        columns = [c["name"] for c in inspect(engine).get_columns("matches")]
+        if "field_homography" not in columns:
+            conn.execute(text("ALTER TABLE matches ADD COLUMN field_homography TEXT"))
+            conn.commit()
+
+try:
+    _migrate_field_homography()
+except Exception:
+    pass
+
 # Ensure directories exist
 UPLOAD_DIR = Path("./data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -506,12 +520,22 @@ def get_tracking_bulk(
     except Exception:
         team_labels_str = {}
 
+    # Load track confidence scores
+    import json as _json
+    confidence_scores = {}
+    try:
+        with open(f"./data/track_confidence_{match_id}.json") as _f:
+            confidence_scores = _json.load(_f)
+    except FileNotFoundError:
+        pass
+
     return {
         "timestamps": timestamps,
         "frames": grouped,
         "assignments": assignments,
         "referee_tracks": referee_tracks,
         "team_labels": team_labels_str,
+        "track_confidence": confidence_scores,
         "start": start,
         "end": end,
     }
@@ -772,6 +796,138 @@ def get_correction_progress(match_id: int):
     })
 
 
+# ─── Full Pipeline (auto-assign + identity correction + event detection) ─────
+
+# Progress dict for the combined pipeline
+pipeline_progress: dict = {}
+
+@app.post("/api/matches/{match_id}/full-pipeline")
+def run_full_pipeline(
+    match_id: int,
+    db: Session = Depends(get_db),
+):
+    """Run complete pipeline: auto-assign → identity correction → event detection."""
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "analyzed":
+        raise HTTPException(400, "Match must be analyzed first")
+
+    # Check not already running
+    prog = pipeline_progress.get(match_id)
+    if prog and not prog.get("done", True):
+        raise HTTPException(400, "Pipeline déjà en cours")
+
+    assign_count = db.query(TrackAssignment).filter_by(match_id=match_id).filter(
+        TrackAssignment.player_id.isnot(None)
+    ).count()
+    if assign_count == 0:
+        raise HTTPException(400, "Assignez d'abord au moins un joueur.")
+
+    pipeline_progress[match_id] = {
+        "percent": 0, "phase": "Démarrage...", "step": 1, "total_steps": 3, "done": False,
+    }
+
+    from database import SessionLocal
+
+    def run_pipeline():
+        session = SessionLocal()
+        try:
+            # Step 1: Auto-assign remaining tracks
+            pipeline_progress[match_id] = {
+                "percent": 5, "phase": "Auto-assignation des tracks...",
+                "step": 1, "total_steps": 3, "done": False,
+            }
+            try:
+                from appearance import auto_assign_tracks
+                result = auto_assign_tracks(match_id, session, threshold=0.38)
+                assigned = result.get("assigned_count", 0)
+            except Exception as e:
+                assigned = 0
+                print(f"[Pipeline] Auto-assign warning: {e}")
+
+            pipeline_progress[match_id] = {
+                "percent": 33, "phase": f"Auto-assignation terminée ({assigned} tracks)",
+                "step": 1, "total_steps": 3, "done": False,
+            }
+
+            # Step 2: Identity correction
+            pipeline_progress[match_id] = {
+                "percent": 35, "phase": "Correction des identités...",
+                "step": 2, "total_steps": 3, "done": False,
+            }
+            try:
+                from identity_corrector import correct_identities, correction_progress
+                # Set sub-progress so we can relay it
+                correction_progress[match_id] = {"percent": 0, "phase": "Démarrage...", "done": False}
+
+                # Run correction in this thread (synchronous)
+                correction_result = correct_identities(match_id, session)
+                corrected = correction_result.get("corrected_count", 0)
+            except Exception as e:
+                corrected = 0
+                print(f"[Pipeline] Identity correction warning: {e}")
+
+            pipeline_progress[match_id] = {
+                "percent": 75, "phase": f"Identités corrigées ({corrected} corrections)",
+                "step": 2, "total_steps": 3, "done": False,
+            }
+
+            # Step 3: Event detection
+            pipeline_progress[match_id] = {
+                "percent": 80, "phase": "Détection des événements...",
+                "step": 3, "total_steps": 3, "done": False,
+            }
+            try:
+                from event_detector import detect_events
+                events = detect_events(match_id, session)
+                event_count = len(events)
+            except Exception as e:
+                event_count = 0
+                print(f"[Pipeline] Event detection warning: {e}")
+
+            pipeline_progress[match_id] = {
+                "percent": 100, "phase": f"Terminé — {event_count} événements détectés",
+                "step": 3, "total_steps": 3, "done": True,
+                "assigned": assigned, "corrected": corrected, "events": event_count,
+            }
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            pipeline_progress[match_id] = {
+                "percent": 100, "phase": f"Erreur: {e}",
+                "step": 0, "total_steps": 3, "done": True, "error": str(e),
+            }
+        finally:
+            session.close()
+
+    thread = threading.Thread(target=run_pipeline, daemon=True)
+    thread.start()
+
+    return {"status": "processing", "message": "Pipeline lancé"}
+
+
+@app.get("/api/matches/{match_id}/pipeline-progress")
+def get_pipeline_progress(match_id: int):
+    """Get progress of the full pipeline."""
+    # Also relay identity correction sub-progress if in step 2
+    prog = pipeline_progress.get(match_id, {
+        "percent": 0, "phase": "", "done": True,
+    })
+    if prog.get("step") == 2 and not prog.get("done"):
+        try:
+            from identity_corrector import correction_progress
+            sub = correction_progress.get(match_id, {})
+            if sub and not sub.get("done"):
+                # Map correction 0-100% to pipeline 35-75%
+                sub_pct = sub.get("percent", 0)
+                prog = {**prog, "percent": 35 + int(sub_pct * 0.4), "phase": sub.get("phase", prog["phase"])}
+        except Exception:
+            pass
+    return prog
+
+
 # ─── Track ↔ Player Assignment ──────────────────────────────────────────────
 
 @app.post("/api/matches/{match_id}/auto-assign-tracks")
@@ -988,6 +1144,303 @@ def leaderboard(event_type: str = Query("goal"), db: Session = Depends(get_db)):
         }
         for r in results
     ]
+
+
+# ─── Field Mapping (Bird's-Eye View) ─────────────────────────────────────────
+
+@app.post("/api/matches/{match_id}/field-mapping")
+def set_field_mapping(
+    match_id: int,
+    corners: str = Form(...),
+    field_length: float = Form(40.0),
+    field_width: float = Form(20.0),
+    db: Session = Depends(get_db),
+):
+    """Set 4 court corner points for homography-based bird's-eye view.
+
+    corners: JSON array of 4 [x, y] normalized coordinates.
+    Order: [top-left, top-right, bottom-left, bottom-right] as seen in video.
+    """
+    import json
+    match = db.query(Match).filter_by(id=match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    try:
+        pts = json.loads(corners)
+        if len(pts) != 4 or not all(len(p) == 2 for p in pts):
+            raise ValueError("Need exactly 4 [x, y] points")
+
+        from tracker.field_mapping import FieldMapper
+        mapper = FieldMapper(
+            corner_points=[tuple(p) for p in pts],
+            field_length=field_length,
+            field_width=field_width,
+        )
+        match.field_homography = mapper.to_json()
+        db.commit()
+        return {"status": "ok", "message": "Field mapping set"}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/matches/{match_id}/field-mapping")
+def get_field_mapping(match_id: int, db: Session = Depends(get_db)):
+    """Get the field mapping configuration for a match."""
+    match = db.query(Match).filter_by(id=match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if not match.field_homography:
+        return {"configured": False}
+
+    import json
+    data = json.loads(match.field_homography)
+    return {"configured": True, **data}
+
+
+@app.get("/api/matches/{match_id}/minimap")
+def get_minimap(
+    match_id: int,
+    t: float = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Generate a bird's-eye view minimap at a given timestamp.
+
+    Returns a JPEG image of the 2D pitch with player positions.
+    Requires field mapping to be configured first.
+    """
+    match = db.query(Match).filter_by(id=match_id).first()
+    if not match or not match.field_homography:
+        raise HTTPException(400, "Field mapping not configured")
+
+    from tracker.field_mapping import FieldMapper
+    mapper = FieldMapper.from_json(match.field_homography)
+
+    # Get player positions at this time
+    frames = (
+        db.query(TrackingFrame)
+        .filter(
+            TrackingFrame.match_id == match_id,
+            TrackingFrame.timestamp_seconds >= t - 0.1,
+            TrackingFrame.timestamp_seconds <= t + 0.1,
+        )
+        .all()
+    )
+
+    # Load assignments and team labels
+    assignments = {}
+    for a in db.query(TrackAssignment).filter_by(match_id=match_id).all():
+        if a.player_id and not a.is_referee:
+            player = db.query(Player).filter_by(id=a.player_id).first()
+            if player:
+                assignments[a.track_id] = player.name
+
+    try:
+        from team_classifier import get_team_labels
+        team_labels = get_team_labels(match_id)
+    except Exception:
+        team_labels = {}
+
+    # Build player position list
+    positions = []
+    seen_tracks = set()
+    for f in frames:
+        if f.track_id in seen_tracks:
+            continue
+        seen_tracks.add(f.track_id)
+        positions.append({
+            "cx": f.bbox_x + f.bbox_w / 2,
+            "cy": f.bbox_y + f.bbox_h / 2,
+            "track_id": f.track_id,
+            "player_name": assignments.get(f.track_id, ""),
+            "team_label": team_labels.get(f.track_id, -1),
+        })
+
+    # Get ball position
+    ball_pos = None
+    ball = (
+        db.query(BallFrame)
+        .filter(
+            BallFrame.match_id == match_id,
+            BallFrame.timestamp_seconds >= t - 0.1,
+            BallFrame.timestamp_seconds <= t + 0.1,
+        )
+        .order_by(BallFrame.confidence.desc())
+        .first()
+    )
+    if ball:
+        ball_pos = (ball.x, ball.y)
+
+    img = mapper.generate_minimap(positions, ball_pos=ball_pos)
+
+    _, buffer = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
+
+@app.get("/api/matches/{match_id}/field-positions")
+def get_field_positions(
+    match_id: int,
+    t: float = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Get player positions in field coordinates (meters) at a given time.
+
+    Returns positions transformed via homography for tactical analysis.
+    """
+    match = db.query(Match).filter_by(id=match_id).first()
+    if not match or not match.field_homography:
+        raise HTTPException(400, "Field mapping not configured")
+
+    from tracker.field_mapping import FieldMapper
+    mapper = FieldMapper.from_json(match.field_homography)
+
+    frames = (
+        db.query(TrackingFrame)
+        .filter(
+            TrackingFrame.match_id == match_id,
+            TrackingFrame.timestamp_seconds >= t - 0.1,
+            TrackingFrame.timestamp_seconds <= t + 0.1,
+        )
+        .all()
+    )
+
+    positions = []
+    seen = set()
+    for f in frames:
+        if f.track_id in seen:
+            continue
+        seen.add(f.track_id)
+        cx = f.bbox_x + f.bbox_w / 2
+        cy = f.bbox_y + f.bbox_h / 2
+        fx, fy = mapper.pixel_to_field(cx, cy)
+        positions.append({
+            "track_id": f.track_id,
+            "pixel_x": round(cx, 4),
+            "pixel_y": round(cy, 4),
+            "field_x": round(fx, 2),
+            "field_y": round(fy, 2),
+        })
+
+    return {"timestamp": t, "positions": positions}
+
+
+# ─── Track Confidence Scores ────────────────────────────────────────────────
+
+@app.get("/api/matches/{match_id}/track-confidence")
+def get_track_confidence(match_id: int, db: Session = Depends(get_db)):
+    """Get confidence scores for all tracks in a match.
+
+    Scores range from 0.0 to 1.0. Higher = more reliable track.
+    Combines: duration, detection confidence, motion consistency, appearance stability.
+    """
+    import json
+
+    path = f"./data/track_confidence_{match_id}.json"
+    try:
+        with open(path) as f:
+            scores = json.load(f)
+        return {"scores": scores}
+    except FileNotFoundError:
+        return {"scores": {}, "message": "Confidence scores not computed yet"}
+
+
+# ─── JSON Export ─────────────────────────────────────────────────────────────
+
+@app.get("/api/matches/{match_id}/export")
+def export_match_data(match_id: int, db: Session = Depends(get_db)):
+    """Export complete match data as JSON.
+
+    Output includes:
+      - player_id, positions over time, events
+      - Track confidence scores
+      - Field positions (if homography configured)
+    """
+    import json
+
+    match = db.query(Match).filter_by(id=match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    # Load assignments
+    assignments = {}
+    for a in db.query(TrackAssignment).filter_by(match_id=match_id).all():
+        if a.player_id and not a.is_referee:
+            player = db.query(Player).filter_by(id=a.player_id).first()
+            if player:
+                assignments[a.track_id] = {
+                    "player_id": player.id,
+                    "name": player.name,
+                    "jersey_number": player.jersey_number,
+                    "position": player.position,
+                }
+
+    # Load field mapper if available
+    mapper = None
+    if match.field_homography:
+        try:
+            from tracker.field_mapping import FieldMapper
+            mapper = FieldMapper.from_json(match.field_homography)
+        except Exception:
+            pass
+
+    # Build per-player position timelines
+    players_data = {}
+    for tid, info in assignments.items():
+        frames = (
+            db.query(TrackingFrame)
+            .filter_by(match_id=match_id, track_id=tid)
+            .order_by(TrackingFrame.timestamp_seconds)
+            .all()
+        )
+        positions = []
+        for f in frames:
+            pos = {
+                "t": f.timestamp_seconds,
+                "x": round(f.bbox_x + f.bbox_w / 2, 4),
+                "y": round(f.bbox_y + f.bbox_h / 2, 4),
+            }
+            if mapper:
+                fx, fy = mapper.pixel_to_field(pos["x"], pos["y"])
+                pos["field_x"] = round(fx, 2)
+                pos["field_y"] = round(fy, 2)
+            positions.append(pos)
+
+        players_data[info["player_id"]] = {
+            **info,
+            "track_id": tid,
+            "positions": positions,
+        }
+
+    # Events
+    events = []
+    for e in db.query(MatchEvent).filter_by(match_id=match_id).order_by(MatchEvent.timestamp_seconds).all():
+        events.append({
+            "player_id": e.player_id,
+            "event_type": e.event_type,
+            "timestamp": e.timestamp_seconds,
+            "x": e.x,
+            "y": e.y,
+        })
+
+    # Confidence scores
+    scores = {}
+    try:
+        with open(f"./data/track_confidence_{match_id}.json") as f:
+            scores = json.load(f)
+    except FileNotFoundError:
+        pass
+
+    return {
+        "match": {
+            "id": match.id,
+            "title": match.title,
+            "duration": match.duration_seconds,
+            "fps": match.fps,
+        },
+        "players": players_data,
+        "events": events,
+        "track_confidence": scores,
+    }
 
 
 # ─── Serve Frontend ──────────────────────────────────────────────────────────

@@ -2,15 +2,15 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   getMatch, getEvents, createEvent, deleteEvent,
-  analyzeMatch, cancelAnalysis, getAnalysisProgress, getTracks, assignTrack, autoAssignTracks, unassignTrack, unassignAllTracks, markReferee,
-  getPlayers, detectEvents, getBallStats, getTrackingBulk,
-  getAutoAssignProgress, correctIdentities, getCorrectionProgress,
-  videoUrl,
+  analyzeMatch, cancelAnalysis, getAnalysisProgress, getTracks, assignTrack, unassignTrack, unassignAllTracks, markReferee,
+  getPlayers, getTrackingBulk,
+  runFullPipeline, getPipelineProgress,
+  videoUrl, getTrackConfidence, exportMatchData,
 } from '../api'
 import {
   Play, Pause, SkipBack, SkipForward, Scan, Loader,
-  Plus, Trash2, CheckCircle, Target, Zap, ArrowRight, ArrowLeft,
-  Eye, EyeOff, MousePointer, X, UserCheck, Users,
+  Plus, Trash2, CheckCircle, Target, Zap,
+  Eye, EyeOff, MousePointer, X, UserCheck, Rocket, Download,
 } from 'lucide-react'
 
 const EVENT_TYPES = [
@@ -46,20 +46,16 @@ export default function MatchDetail() {
   const [tracks, setTracks] = useState([])
   const [currentTime, setCurrentTime] = useState(0)
   const [playing, setPlaying] = useState(false)
-  const [tab, setTab] = useState('events')
 
   const [selectedPlayer, setSelectedPlayer] = useState('')
   const [selectedEvent, setSelectedEvent] = useState('goal')
   const [progress, setProgress] = useState(null)
-  const [attacksRight, setAttacksRight] = useState(true)
-  const [detecting, setDetecting] = useState(false)
-  const [detectError, setDetectError] = useState('')
-  const [ballCount, setBallCount] = useState(null)
-  const [autoAssigning, setAutoAssigning] = useState(false)
-  const [autoAssignProgress, setAutoAssignProgress] = useState(null)
-  const [autoAssignResult, setAutoAssignResult] = useState(null)
-  const [correcting, setCorrecting] = useState(false)
-  const [correctionProgress, setCorrectionProgress] = useState(null)
+  // Full pipeline state
+  const [pipelineRunning, setPipelineRunning] = useState(false)
+  const [pipelineProgress, setPipelineProgress] = useState(null)
+  const [pipelineResult, setPipelineResult] = useState(null)
+
+  const [trackConfidence, setTrackConfidence] = useState({}) // track_id → score
 
   // Overlay state
   const [overlayEnabled, setOverlayEnabled] = useState(true)
@@ -85,7 +81,7 @@ export default function MatchDetail() {
     if (m.status === 'analyzed') {
       const tr = await getTracks(id, 30)
       setTracks(tr)
-      getBallStats(id).then(s => setBallCount(s.ball_detections)).catch(() => {})
+      getTrackConfidence(id).then(r => setTrackConfidence(r.scores || {})).catch(() => {})
     }
   }, [id])
 
@@ -108,8 +104,7 @@ export default function MatchDetail() {
         if (m.status === 'analyzed') {
           const tr = await getTracks(id, 30)
           setTracks(tr)
-          getBallStats(id).then(s => setBallCount(s.ball_detections)).catch(() => {})
-        }
+            }
       }
     }, 1500)
     return () => clearInterval(interval)
@@ -326,10 +321,10 @@ export default function MatchDetail() {
     ctx.scale(dpr, dpr)
     ctx.clearRect(0, 0, rect.width, rect.height)
 
-    if (!overlayBoxes.length) return
-
     const w = rect.width
     const h = rect.height
+
+    if (!overlayBoxes.length) return
 
     for (const box of overlayBoxes) {
       const [bx, by, bw, bh] = box.bbox
@@ -555,103 +550,58 @@ export default function MatchDetail() {
     if (!confirm('Supprimer toutes les assignations de joueurs ?')) return
     try {
       await unassignAllTracks(id)
-      setAutoAssignResult(null)
+      setPipelineResult(null)
       const tr = await getTracks(id, 30)
       setTracks(tr)
-      // Clear bulk cache so overlay refreshes
       bulkCache.current = []
     } catch (err) {
       alert(err.message)
     }
   }
 
-  const handleAutoAssign = async () => {
-    setAutoAssigning(true)
-    setAutoAssignResult(null)
-    setAutoAssignProgress(null)
+  // ── Full pipeline (auto-assign + correction + event detection) ──
+  const handleRunPipeline = async () => {
+    setPipelineRunning(true)
+    setPipelineProgress(null)
+    setPipelineResult(null)
     try {
-      await autoAssignTracks(id)
+      await runFullPipeline(id)
     } catch (err) {
-      setAutoAssignResult({ error: err.message })
-      setAutoAssigning(false)
+      setPipelineResult({ error: err.message })
+      setPipelineRunning(false)
     }
   }
 
-  // ── Identity correction ──────────────────────────────────────────
-  const handleCorrectIdentities = async () => {
-    setCorrecting(true)
-    setCorrectionProgress(null)
-    try {
-      await correctIdentities(id)
-    } catch (err) {
-      setCorrectionProgress({ done: true, error: err.message })
-      setCorrecting(false)
-    }
-  }
-
-  // Correction progress polling
+  // Pipeline progress polling
   useEffect(() => {
-    if (!correcting) return
+    if (!pipelineRunning) return
     const interval = setInterval(async () => {
       try {
-        const p = await getCorrectionProgress(id)
-        setCorrectionProgress(p)
-        if (p.done || p.percent >= 100) {
-          clearInterval(interval)
-          const tr = await getTracks(id, 30)
-          setTracks(tr)
-          bulkCache.current = []
-          setCorrecting(false)
-        }
-      } catch { /* ignore */ }
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [correcting, id])
-
-  // Auto-assign progress polling
-  useEffect(() => {
-    if (!autoAssigning) return
-    const interval = setInterval(async () => {
-      try {
-        const p = await getAutoAssignProgress(id)
-        setAutoAssignProgress(p)
+        const p = await getPipelineProgress(id)
+        setPipelineProgress(p)
         if (p.done || p.percent >= 100) {
           clearInterval(interval)
           if (p.error) {
-            setAutoAssignResult({ error: p.error })
+            setPipelineResult({ error: p.error })
           } else {
-            setAutoAssignResult({
-              assigned_count: p.assigned_count ?? 0,
-              message: p.message || '',
+            setPipelineResult({
+              assigned: p.assigned || 0,
+              corrected: p.corrected || 0,
+              events: p.events || 0,
             })
           }
           const tr = await getTracks(id, 30)
           setTracks(tr)
+          const ev = await getEvents(id)
+          setEvents(ev)
+          bulkCache.current = []
           invalidateOverlayCache()
-          updateOverlay(currentTime)
-          setAutoAssigning(false)
+          setPipelineRunning(false)
         }
-      } catch {
-        // ignore polling errors
-      }
-    }, 800)
+      } catch { /* ignore */ }
+    }, 1000)
     return () => clearInterval(interval)
-  }, [autoAssigning, id])
-
-  const handleDetectEvents = async () => {
-    setDetecting(true)
-    setDetectError('')
-    try {
-      await detectEvents(id, attacksRight)
-      const ev = await getEvents(id)
-      setEvents(ev)
-      setTab('events')
-    } catch (err) {
-      setDetectError(err.message)
-    } finally {
-      setDetecting(false)
-    }
-  }
+  }, [pipelineRunning, id])
 
   // ── Computed values ──────────────────────────────────────────────────
 
@@ -737,9 +687,7 @@ export default function MatchDetail() {
               {match.status === 'analyzed' && overlayEnabled && (
                 <canvas
                   ref={canvasRef}
-                  className={`absolute inset-0 w-full h-full ${
-                    assignMode ? 'cursor-crosshair' : 'cursor-pointer'
-                  }`}
+                  className={`absolute inset-0 w-full h-full ${assignMode ? 'cursor-crosshair' : 'cursor-pointer'}`}
                   onClick={handleCanvasClick}
                 />
               )}
@@ -891,87 +839,287 @@ export default function MatchDetail() {
             </div>
           </div>
 
-          {/* Add Event Form */}
-          <div className="card mt-4">
-            <h3 className="font-semibold mb-3 flex items-center gap-2 text-sm">
-              <Target size={15} className="text-red-500" /> Ajouter un événement à {formatTime(currentTime)}
-            </h3>
-            <form onSubmit={handleAddEvent} className="flex gap-2 flex-wrap">
-              <select
-                className="input w-auto flex-1"
-                value={selectedPlayer}
-                onChange={(e) => setSelectedPlayer(e.target.value)}
-              >
-                <option value="">-- Joueur --</option>
-                {players.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="input w-auto"
-                value={selectedEvent}
-                onChange={(e) => setSelectedEvent(e.target.value)}
-              >
-                {EVENT_TYPES.map((et) => (
-                  <option key={et.value} value={et.value}>{et.emoji} {et.label}</option>
-                ))}
-              </select>
-              <button type="submit" className="btn-primary btn-sm flex items-center gap-1" disabled={!selectedPlayer}>
-                <Plus size={14} /> Ajouter
-              </button>
-            </form>
-          </div>
+          {/* Add Event Form (compact) */}
+          {match.status === 'analyzed' && (
+            <div className="card mt-4">
+              <form onSubmit={handleAddEvent} className="flex gap-2 items-center flex-wrap">
+                <span className="text-xs text-gray-500 font-mono shrink-0">{formatTime(currentTime)}</span>
+                <select
+                  className="input w-auto flex-1 text-sm py-1.5"
+                  value={selectedPlayer}
+                  onChange={(e) => setSelectedPlayer(e.target.value)}
+                >
+                  <option value="">Joueur...</option>
+                  {players.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  className="input w-auto text-sm py-1.5"
+                  value={selectedEvent}
+                  onChange={(e) => setSelectedEvent(e.target.value)}
+                >
+                  {EVENT_TYPES.map((et) => (
+                    <option key={et.value} value={et.value}>{et.emoji} {et.label}</option>
+                  ))}
+                </select>
+                <button type="submit" className="btn-primary btn-sm flex items-center gap-1" disabled={!selectedPlayer}>
+                  <Plus size={14} />
+                </button>
+              </form>
+            </div>
+          )}
         </div>
 
         {/* ── Side Panel ────────────────────────────────────────── */}
-        <div className="card">
-          <div className="flex border-b border-blue-900/30 mb-4 -mx-6 -mt-6 px-6">
-            <button
-              className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-                tab === 'events' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-500 hover:text-gray-300'
-              }`}
-              onClick={() => setTab('events')}
-            >
-              Events ({events.length})
-            </button>
-            <button
-              className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-                tab === 'players' ? 'border-blue-500 text-blue-400' : 'border-transparent text-gray-500 hover:text-gray-300'
-              }`}
-              onClick={() => setTab('players')}
-            >
-              Joueurs ({assignedCount})
-            </button>
-            <button
-              className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-                tab === 'detect' ? 'border-yellow-500 text-yellow-400' : 'border-transparent text-gray-500 hover:text-gray-300'
-              }`}
-              onClick={() => setTab('detect')}
-            >
-              Auto-detect
-            </button>
-          </div>
+        <div className="space-y-4">
 
-          {/* ── Events tab ──────────────────────────────────────── */}
-          {tab === 'events' && (
-            <div className="space-y-1.5 max-h-[600px] overflow-y-auto pr-1">
+          {/* Workflow Stepper Card */}
+          {match.status === 'analyzed' && (
+            <div className="card">
+              <h3 className="font-semibold text-sm mb-3 flex items-center gap-2">
+                <Rocket size={15} className="text-blue-400" /> Workflow
+              </h3>
+
+              {/* Step 1: Identify players */}
+              <div className="space-y-3">
+                <div className={`flex items-start gap-3 p-3 rounded-xl transition-colors ${
+                  assignedCount === 0 ? 'bg-yellow-500/10 border border-yellow-500/20' : 'bg-slate-800/40'
+                }`}>
+                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                    assignedCount > 0 ? 'bg-emerald-500 text-white' : 'bg-yellow-500/30 text-yellow-300'
+                  }`}>
+                    {assignedCount > 0 ? <CheckCircle size={14} /> : '1'}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium">Identifier les joueurs</p>
+                    <p className="text-[10px] text-gray-500">
+                      {assignedCount === 0
+                        ? "Activez le mode Assigner et cliquez sur les joueurs"
+                        : `${assignedCount} joueur${assignedCount !== 1 ? 's' : ''} identifié${assignedCount !== 1 ? 's' : ''} sur ${tracks.length} tracks`
+                      }
+                    </p>
+                    {assignedCount === 0 && !assignMode && (
+                      <button
+                        onClick={() => setAssignMode(true)}
+                        className="mt-2 flex items-center gap-1.5 px-3 py-1.5 bg-yellow-500/20 hover:bg-yellow-500/30 border border-yellow-500/30 rounded-lg text-yellow-300 text-xs font-medium transition-colors"
+                      >
+                        <MousePointer size={12} /> Commencer
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Step 2: Finalize */}
+                <div className={`flex items-start gap-3 p-3 rounded-xl transition-colors ${
+                  assignedCount > 0 && !pipelineRunning && !pipelineResult ? 'bg-blue-500/10 border border-blue-500/20' : 'bg-slate-800/40'
+                }`}>
+                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                    pipelineResult && !pipelineResult.error ? 'bg-emerald-500 text-white' : 'bg-blue-500/30 text-blue-300'
+                  }`}>
+                    {pipelineResult && !pipelineResult.error ? <CheckCircle size={14} /> : '2'}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium">Finaliser l'analyse</p>
+                    <p className="text-[10px] text-gray-500">
+                      Auto-assignation + correction d'identités + détection d'événements
+                    </p>
+
+                    {/* Pipeline button */}
+                    {assignedCount > 0 && !pipelineRunning && (
+                      <button
+                        onClick={handleRunPipeline}
+                        className="mt-2 w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 rounded-xl text-white text-sm font-medium transition-all shadow-lg shadow-blue-500/20"
+                      >
+                        <Zap size={15} /> Finaliser l'analyse
+                      </button>
+                    )}
+
+                    {/* Pipeline progress */}
+                    {pipelineRunning && (
+                      <div className="mt-2 space-y-2 p-3 bg-slate-800/60 rounded-lg">
+                        <div className="flex items-center gap-2">
+                          <Loader size={14} className="animate-spin text-blue-400 shrink-0" />
+                          <span className="text-xs text-blue-300 flex-1 truncate">
+                            {pipelineProgress?.phase || 'Démarrage...'}
+                          </span>
+                          <span className="text-xs font-mono text-blue-400">
+                            {pipelineProgress?.percent || 0}%
+                          </span>
+                        </div>
+                        <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
+                          <div
+                            className="bg-gradient-to-r from-blue-500 to-emerald-400 h-full rounded-full transition-all duration-500"
+                            style={{ width: `${pipelineProgress?.percent || 0}%` }}
+                          />
+                        </div>
+                        {/* Step indicators */}
+                        <div className="flex gap-1.5 text-[10px]">
+                          {['Auto-assign', 'Correction', 'Événements'].map((label, i) => (
+                            <span key={i} className={`px-1.5 py-0.5 rounded ${
+                              (pipelineProgress?.step || 0) > i + 1 ? 'bg-emerald-500/20 text-emerald-400' :
+                              (pipelineProgress?.step || 0) === i + 1 ? 'bg-blue-500/20 text-blue-300' :
+                              'bg-slate-700/50 text-gray-600'
+                            }`}>
+                              {label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Pipeline result */}
+                    {pipelineResult && (
+                      <div className={`mt-2 text-xs px-3 py-2 rounded-lg ${
+                        pipelineResult.error ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'
+                      }`}>
+                        {pipelineResult.error
+                          ? pipelineResult.error
+                          : `${pipelineResult.events} événements détectés`
+                        }
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Reset + export */}
+              {assignedCount > 0 && (
+                <div className="flex gap-2 mt-3 pt-3 border-t border-slate-700/30">
+                  <button
+                    onClick={handleResetAssignments}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                  >
+                    <Trash2 size={12} /> Reset assignations
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const data = await exportMatchData(id)
+                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `match_${id}_export.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                    }}
+                    className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs text-gray-500 hover:text-gray-300 hover:bg-slate-800 rounded-lg transition-colors"
+                  >
+                    <Download size={12} /> Export JSON
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Players list card */}
+          {match.status === 'analyzed' && assignedCount > 0 && (
+            <div className="card">
+              <h3 className="font-semibold text-sm mb-3 flex items-center gap-2">
+                <UserCheck size={15} className="text-emerald-400" /> Joueurs identifiés
+              </h3>
+              <div className="space-y-1.5 max-h-[300px] overflow-y-auto pr-1">
+                {assignedTracks.map((t) => {
+                  const player = players.find(p => p.id === t.player_id)
+                  if (!player) return null
+                  return (
+                    <div
+                      key={t.track_id}
+                      className="flex items-center gap-2.5 px-3 py-2 bg-slate-800/60 rounded-xl text-sm"
+                    >
+                      <div
+                        className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
+                        style={{ backgroundColor: player.team_color + '25', color: player.team_color }}
+                      >
+                        {player.jersey_number ?? '?'}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-sm truncate">{player.name}</p>
+                        <p className="text-[10px] text-gray-600">
+                          {formatTime(t.first_seen)} - {formatTime(t.last_seen)}
+                          {trackConfidence[String(t.track_id)] !== undefined && (
+                            <span className={`ml-1 font-mono ${
+                              trackConfidence[String(t.track_id)] > 0.7 ? 'text-emerald-500' :
+                              trackConfidence[String(t.track_id)] > 0.4 ? 'text-yellow-500' : 'text-red-500'
+                            }`}>
+                              {Math.round(trackConfidence[String(t.track_id)] * 100)}%
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => handleUnassignFromOverlay(t.track_id)}
+                        className="p-1 text-gray-600 hover:text-red-400 transition-colors"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Unassigned players hint */}
+              {players.filter(p => !assignedPlayerIds.has(p.id)).length > 0 && (
+                <div className="mt-3 pt-2 border-t border-slate-700/30">
+                  <p className="text-[10px] text-gray-600 mb-1.5">Non identifiés :</p>
+                  <div className="flex flex-wrap gap-1">
+                    {players.filter(p => !assignedPlayerIds.has(p.id)).map((p) => (
+                      <span
+                        key={p.id}
+                        className="px-1.5 py-0.5 bg-slate-800/40 rounded text-[10px] text-gray-500 flex items-center gap-1"
+                      >
+                        <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: p.team_color }} />
+                        {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Referee tracks */}
+              {refereeTracks.length > 0 && (
+                <div className="mt-3 pt-2 border-t border-slate-700/30">
+                  {refereeTracks.map((t) => (
+                    <div key={t.track_id} className="flex items-center gap-2 px-2 py-1.5 text-xs text-yellow-300">
+                      <span>Arbitre</span>
+                      <span className="text-gray-600 text-[10px]">#{t.track_id}</span>
+                      <button
+                        onClick={() => handleUnassignFromOverlay(t.track_id)}
+                        className="ml-auto p-0.5 text-gray-600 hover:text-red-400"
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Events Card */}
+          <div className="card">
+            <h3 className="font-semibold text-sm mb-3 flex items-center gap-2">
+              <Target size={15} className="text-red-400" /> Événements
+              <span className="text-gray-600 text-xs font-normal">({events.length})</span>
+            </h3>
+            <div className="space-y-1 max-h-[400px] overflow-y-auto pr-1">
               {events.length === 0 ? (
-                <p className="text-gray-500 text-sm text-center py-8">
-                  Aucun événement enregistré.
+                <p className="text-gray-600 text-xs text-center py-6">
+                  Aucun événement
                 </p>
               ) : events.map((ev) => (
                 <div
                   key={ev.id}
-                  className="flex items-center gap-2 px-3 py-2 bg-slate-800/60 hover:bg-slate-800 rounded-xl text-sm cursor-pointer transition-colors"
+                  className="flex items-center gap-2 px-2.5 py-1.5 bg-slate-800/60 hover:bg-slate-800 rounded-lg text-sm cursor-pointer transition-colors"
                   onClick={() => seekTo(ev.event_type === 'goal' ? Math.max(0, ev.timestamp_seconds - 5) : ev.timestamp_seconds, true)}
                 >
-                  <span className="font-mono text-[10px] text-gray-500 w-10 shrink-0">{formatTime(ev.timestamp_seconds)}</span>
-                  <span className="shrink-0">{EVENT_TYPES.find((e) => e.value === ev.event_type)?.emoji}</span>
+                  <span className="font-mono text-[10px] text-gray-600 w-9 shrink-0">{formatTime(ev.timestamp_seconds)}</span>
+                  <span className="shrink-0 text-xs">{EVENT_TYPES.find((e) => e.value === ev.event_type)?.emoji}</span>
                   <div className="flex-1 min-w-0">
-                    <span className="font-medium">{ev.player_name}</span>
-                    <span className="text-gray-500 ml-1 text-xs">
+                    <span className="font-medium text-sm">{ev.player_name}</span>
+                    <span className="text-gray-500 ml-1 text-[10px]">
                       {EVENT_TYPES.find((e) => e.value === ev.event_type)?.label}
                     </span>
                   </div>
@@ -980,302 +1128,12 @@ export default function MatchDetail() {
                     onClick={(e) => { e.stopPropagation(); handleDeleteEvent(ev.id) }}
                     className="text-gray-600 hover:text-red-400 shrink-0"
                   >
-                    <Trash2 size={12} />
+                    <Trash2 size={11} />
                   </button>
                 </div>
               ))}
             </div>
-          )}
-
-          {/* ── Players / Assignment tab ────────────────────────── */}
-          {tab === 'players' && (
-            <div className="space-y-4">
-              {match.status !== 'analyzed' ? (
-                <p className="text-gray-500 text-sm text-center py-8">
-                  Lancez d'abord l'analyse YOLO pour détecter les joueurs.
-                </p>
-              ) : (
-                <>
-                  <div className="flex items-center gap-3 p-3 bg-slate-800/60 rounded-xl">
-                    <UserCheck size={18} className="text-blue-400 shrink-0" />
-                    <div className="flex-1">
-                      <p className="text-sm font-medium">
-                        {assignedCount} joueur{assignedCount !== 1 && 's'} identifié{assignedCount !== 1 && 's'}
-                      </p>
-                      <p className="text-xs text-gray-500">
-                        {assignedCount === 0
-                          ? "Activez le mode 'Assigner' et cliquez sur les joueurs dans la vidéo"
-                          : `sur ${tracks.length} tracks détectés`}
-                      </p>
-                    </div>
-                  </div>
-
-                  {!assignMode && assignedCount === 0 && (
-                    <button
-                      onClick={() => setAssignMode(true)}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-yellow-500/10 hover:bg-yellow-500/20 border border-yellow-500/30 rounded-xl text-yellow-300 text-sm font-medium transition-colors"
-                    >
-                      <MousePointer size={15} /> Commencer l'identification des joueurs
-                    </button>
-                  )}
-
-                  {/* Auto-assign button + reset + progress */}
-                  {assignedCount > 0 && !autoAssigning && (
-                    <div className="flex gap-2">
-                      <button
-                        onClick={handleAutoAssign}
-                        className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-xl text-blue-300 text-sm font-medium transition-colors"
-                      >
-                        <Zap size={15} /> Auto-assigner
-                      </button>
-                      <button
-                        onClick={handleResetAssignments}
-                        className="flex items-center justify-center gap-2 px-3 py-2.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 rounded-xl text-red-400 text-sm font-medium transition-colors"
-                        title="Supprimer toutes les assignations"
-                      >
-                        <Trash2 size={15} /> Reset
-                      </button>
-                    </div>
-                  )}
-                  {autoAssigning && autoAssignProgress && (
-                    <div className="space-y-2 p-3 bg-slate-800/60 rounded-xl">
-                      <div className="flex items-center gap-2">
-                        <Loader size={14} className="animate-spin text-blue-400 shrink-0" />
-                        <span className="text-xs text-blue-300 flex-1 truncate">
-                          {autoAssignProgress.phase || 'Démarrage...'}
-                        </span>
-                        <span className="text-xs font-mono text-blue-400">
-                          {autoAssignProgress.percent || 0}%
-                        </span>
-                      </div>
-                      <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
-                        <div
-                          className="bg-gradient-to-r from-blue-500 to-blue-400 h-full rounded-full transition-all duration-500"
-                          style={{ width: `${autoAssignProgress.percent || 0}%` }}
-                        />
-                      </div>
-                      <p className="text-[10px] text-gray-600">
-                        {autoAssignProgress.current || 0} / {autoAssignProgress.total || '?'} tracks
-                      </p>
-                    </div>
-                  )}
-                  {autoAssigning && !autoAssignProgress && (
-                    <div className="flex items-center justify-center gap-2 p-3 bg-slate-800/60 rounded-xl">
-                      <Loader size={14} className="animate-spin text-blue-400" />
-                      <span className="text-xs text-blue-300">Démarrage de l'analyse...</span>
-                    </div>
-                  )}
-                  {autoAssignResult && (
-                    <div className={`text-xs px-3 py-2 rounded-lg ${autoAssignResult.error ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'}`}>
-                      {autoAssignResult.error
-                        ? autoAssignResult.error
-                        : autoAssignResult.message
-                          ? autoAssignResult.message
-                          : `${autoAssignResult.assigned_count} tracks auto-assignés`
-                      }
-                    </div>
-                  )}
-
-                  {/* Identity correction button + progress */}
-                  {assignedCount >= 2 && !correcting && !autoAssigning && (
-                    <button
-                      onClick={handleCorrectIdentities}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded-xl text-emerald-300 text-sm font-medium transition-colors"
-                      title="Ré-identifie chaque joueur frame par frame en utilisant la couleur du maillot"
-                    >
-                      <Target size={15} /> Corriger les identités (haute précision)
-                    </button>
-                  )}
-                  {correcting && (
-                    <div className="space-y-2 p-3 bg-slate-800/60 rounded-xl">
-                      <div className="flex items-center gap-2">
-                        <Loader size={14} className="animate-spin text-emerald-400 shrink-0" />
-                        <span className="text-xs text-emerald-300 flex-1 truncate">
-                          {correctionProgress?.phase || 'Démarrage...'}
-                        </span>
-                        <span className="text-xs font-mono text-emerald-400">
-                          {correctionProgress?.percent || 0}%
-                        </span>
-                      </div>
-                      <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
-                        <div
-                          className="bg-gradient-to-r from-emerald-500 to-emerald-400 h-full rounded-full transition-all duration-500"
-                          style={{ width: `${correctionProgress?.percent || 0}%` }}
-                        />
-                      </div>
-                    </div>
-                  )}
-
-                  {/* List of assigned players */}
-                  {assignedCount > 0 && (
-                    <div className="space-y-1.5 max-h-[400px] overflow-y-auto pr-1">
-                      {assignedTracks.map((t) => {
-                        const player = players.find(p => p.id === t.player_id)
-                        if (!player) return null
-                        return (
-                          <div
-                            key={t.track_id}
-                            className="flex items-center gap-3 px-3 py-2.5 bg-slate-800/60 rounded-xl text-sm"
-                          >
-                            <div
-                              className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold shrink-0"
-                              style={{ backgroundColor: player.team_color + '25', color: player.team_color }}
-                            >
-                              {player.jersey_number ?? '?'}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="font-medium truncate">{player.name}</p>
-                              <p className="text-[10px] text-gray-500">
-                                Track #{t.track_id} &middot; {t.frame_count} frames &middot; {formatTime(t.first_seen)}→{formatTime(t.last_seen)}
-                              </p>
-                            </div>
-                            <button
-                              onClick={() => handleUnassignFromOverlay(t.track_id)}
-                              className="p-1 text-gray-600 hover:text-red-400 transition-colors"
-                            >
-                              <X size={13} />
-                            </button>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )}
-
-                  {/* Referee tracks */}
-                  {refereeTracks.length > 0 && (
-                    <div>
-                      <p className="text-xs text-gray-600 mb-1.5">Arbitre{refereeTracks.length > 1 && 's'} :</p>
-                      <div className="space-y-1">
-                        {refereeTracks.map((t) => (
-                          <div key={t.track_id} className="flex items-center gap-2 px-3 py-2 bg-yellow-900/10 border border-yellow-500/20 rounded-lg text-xs">
-                            <span className="text-sm">🟨</span>
-                            <span className="text-yellow-300 font-medium flex-1">Arbitre</span>
-                            <span className="text-gray-600 text-[10px]">Track #{t.track_id}</span>
-                            <button
-                              onClick={() => handleUnassignFromOverlay(t.track_id)}
-                              className="p-0.5 text-gray-600 hover:text-red-400 transition-colors"
-                            >
-                              <X size={11} />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Unassigned players hint */}
-                  {players.length > 0 && (
-                    <div>
-                      <p className="text-xs text-gray-600 mb-2">Joueurs non identifiés :</p>
-                      <div className="flex flex-wrap gap-1.5">
-                        {players.filter(p => !assignedPlayerIds.has(p.id)).map((p) => (
-                          <span
-                            key={p.id}
-                            className="px-2 py-1 bg-slate-800/40 rounded-lg text-[10px] text-gray-500 flex items-center gap-1"
-                          >
-                            <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: p.team_color }} />
-                            {p.jersey_number ? `#${p.jersey_number} ` : ''}{p.name}
-                          </span>
-                        ))}
-                        {players.filter(p => !assignedPlayerIds.has(p.id)).length === 0 && (
-                          <span className="text-[10px] text-emerald-500">Tous les joueurs sont identifiés !</span>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-
-          {/* ── Auto-detect tab ─────────────────────────────────── */}
-          {tab === 'detect' && (
-            <div className="space-y-4">
-              {match.status !== 'analyzed' ? (
-                <p className="text-gray-500 text-sm text-center py-8">
-                  Lancez d'abord l'analyse YOLO pour détecter joueurs et ballon.
-                </p>
-              ) : (
-                <>
-                  {ballCount !== null && (
-                    <div className="text-xs text-gray-500 mb-2">
-                      Ballon détecté dans {ballCount} frames
-                      {ballCount === 0 && (
-                        <span className="text-red-400 ml-1">
-                          — le ballon n'a pas été détecté, la détection sera limitée
-                        </span>
-                      )}
-                    </div>
-                  )}
-
-                  <div>
-                    <p className="text-sm font-medium mb-2">Direction d'attaque de l'équipe</p>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setAttacksRight(true)}
-                        className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-sm transition-all ${
-                          attacksRight
-                            ? 'bg-blue-600/20 border border-blue-500/40 text-blue-300'
-                            : 'bg-slate-800/60 text-gray-500 hover:bg-slate-800'
-                        }`}
-                      >
-                        {match.team?.name || 'Equipe'} <ArrowRight size={14} />
-                      </button>
-                      <button
-                        onClick={() => setAttacksRight(false)}
-                        className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-sm transition-all ${
-                          !attacksRight
-                            ? 'bg-blue-600/20 border border-blue-500/40 text-blue-300'
-                            : 'bg-slate-800/60 text-gray-500 hover:bg-slate-800'
-                        }`}
-                      >
-                        <ArrowLeft size={14} /> {match.team?.name || 'Equipe'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-3 p-3 bg-slate-800/60 rounded-xl">
-                    <Users size={16} className={assignedCount > 0 ? 'text-emerald-400' : 'text-red-400'} />
-                    <div>
-                      <p className="text-sm">
-                        {assignedCount > 0 ? (
-                          <span className="text-emerald-400">{assignedCount} joueurs assignés</span>
-                        ) : (
-                          <span className="text-red-400">Aucun joueur assigné</span>
-                        )}
-                      </p>
-                      {assignedCount === 0 && (
-                        <p className="text-[10px] text-gray-500">
-                          Identifiez d'abord les joueurs dans l'onglet Joueurs
-                        </p>
-                      )}
-                    </div>
-                  </div>
-
-                  {detectError && (
-                    <p className="text-red-400 text-xs bg-red-900/10 border border-red-900/30 rounded-lg px-3 py-2">{detectError}</p>
-                  )}
-
-                  <button
-                    onClick={handleDetectEvents}
-                    disabled={detecting || assignedCount === 0}
-                    className="btn-primary w-full flex items-center justify-center gap-2"
-                  >
-                    {detecting ? (
-                      <><Loader size={16} className="animate-spin" /> Détection en cours...</>
-                    ) : (
-                      <><Zap size={16} /> Détecter les événements</>
-                    )}
-                  </button>
-
-                  <p className="text-[10px] text-gray-600">
-                    Remplace tous les événements existants par les événements auto-détectés
-                    (passes, interceptions, tirs, buts, assists, dribbles, key passes, saves).
-                  </p>
-                </>
-              )}
-            </div>
-          )}
+          </div>
         </div>
       </div>
     </div>
