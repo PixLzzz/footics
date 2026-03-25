@@ -1,11 +1,25 @@
 """
-Frame-by-frame identity correction with brightness-based team filter.
+Frame-by-frame identity correction with brightness team filter + ReID appearance.
 
-Simple and reliable:
-  1. Build brightness profile for each assigned player → team brightness
+Pipeline:
+  1. Build player profiles: brightness (team filter) + ReID features (discrimination)
   2. HARD REJECT any detection whose brightness differs from team by > threshold
-  3. Among team detections: match to players by position + velocity (primary) + color (secondary)
-  4. Update track_ids in database
+  3. Among team detections: match to players using cost matrix:
+     - Position + velocity prediction (70% weight) — primary spatial signal
+     - ReID appearance similarity (20% weight) — distinguishes same-team players
+     - Color histogram distance (10% weight) — lightweight backup
+  4. Hungarian algorithm for optimal 1-to-1 assignment
+  5. Update track_ids in database
+
+Design decisions:
+  - Brightness filter is the FIRST gate — reliably separates white vs dark jerseys
+  - ReID features (142D descriptor) replace color histogram as the main appearance
+    signal for same-team discrimination. They combine color, spatial layout, and
+    body proportions — much more discriminative than histogram alone.
+  - Position+velocity is still dominant (70%) because appearance changes with
+    pose/angle/occlusion, but position is always reliable for short time gaps.
+  - ReID gallery from the tracking phase is loaded if available, avoiding
+    re-extraction from video for the assigned player profiles.
 """
 
 import cv2
@@ -26,8 +40,11 @@ PROFILE_SAMPLES = 10
 MAX_MATCH_COST = 0.60
 MAX_POSITION_JUMP = 0.12
 BRIGHTNESS_TOLERANCE = 45
-POSITION_WEIGHT = 0.85
-COLOR_WEIGHT = 0.15
+
+# Cost weights — ReID now takes a significant share from color histogram
+POSITION_WEIGHT = 0.70
+REID_WEIGHT = 0.20
+COLOR_WEIGHT = 0.10
 
 
 def _extract_torso_crop(frame, bbox_x, bbox_y, bbox_w, bbox_h):
@@ -104,6 +121,25 @@ def correct_identities(match_id: int, db: Session) -> dict:
     total_ts = len(all_timestamps)
 
     correction_progress[match_id] = {
+        "percent": 3, "phase": "Chargement ReID...", "done": False,
+    }
+
+    # ── Load ReID features from saved gallery ────────────────────────
+    # These were extracted during tracking (video_processor.py) so we
+    # don't need to re-extract from video for known tracks.
+    reid_extractor = None
+    saved_reid = {}
+    try:
+        from tracker.reid import AppearanceExtractor, cosine_similarity
+        from video_processor import load_reid_gallery
+        reid_extractor = AppearanceExtractor()
+        saved_reid = load_reid_gallery(match_id)
+        if saved_reid:
+            logger.info(f"Match {match_id}: loaded ReID gallery ({len(saved_reid)} tracks)")
+    except Exception as e:
+        logger.warning(f"ReID not available: {e}")
+
+    correction_progress[match_id] = {
         "percent": 5, "phase": "Profils joueurs...", "done": False,
     }
 
@@ -118,10 +154,15 @@ def correct_identities(match_id: int, db: Session) -> dict:
     player_canonical_tid = {}
     player_brightness = {}
     player_hists = {}
+    player_reid = {}  # pid → 142D ReID descriptor
 
     for orig_tid, assignment in player_assignments.items():
         pid = assignment.player_id
         player_canonical_tid[pid] = orig_tid
+
+        # Try to load ReID descriptor from saved gallery
+        if orig_tid in saved_reid:
+            player_reid[pid] = saved_reid[orig_tid]
 
         track_frames = [f for f in all_frames if f.track_id == orig_tid]
         if not track_frames:
@@ -134,7 +175,7 @@ def correct_identities(match_id: int, db: Session) -> dict:
         if not sampled:
             sampled = [track_frames[len(track_frames) // 2]]
 
-        b_vals, h_vals = [], []
+        b_vals, h_vals, reid_vals = [], [], []
         for sf in sampled:
             frame_num = int(sf.timestamp_seconds * fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
@@ -149,17 +190,31 @@ def correct_identities(match_id: int, db: Session) -> dict:
             if h is not None:
                 h_vals.append(h)
 
+            # Extract ReID features if not already loaded from gallery
+            if pid not in player_reid and reid_extractor and crop is not None:
+                feat = reid_extractor.extract_features(crop, sf.bbox_w, sf.bbox_h)
+                if feat is not None:
+                    reid_vals.append(feat)
+
         if b_vals:
             player_brightness[pid] = float(np.median(b_vals))
         if h_vals:
             player_hists[pid] = np.median(h_vals, axis=0).astype(np.float32)
+        if reid_vals and pid not in player_reid:
+            player_reid[pid] = np.median(np.stack(reid_vals), axis=0).astype(np.float32)
+            norm = np.linalg.norm(player_reid[pid])
+            if norm > 0:
+                player_reid[pid] /= norm
 
     if not player_brightness:
         cap.release()
         return {"error": "Impossible d'extraire les profils."}
 
     team_brightness = float(np.median(list(player_brightness.values())))
-    logger.info(f"Match {match_id}: team brightness={team_brightness:.0f}")
+    logger.info(
+        f"Match {match_id}: team brightness={team_brightness:.0f}, "
+        f"ReID profiles={len(player_reid)}/{len(player_canonical_tid)}"
+    )
 
     # Team labels
     team_track_ids = None
@@ -191,6 +246,7 @@ def correct_identities(match_id: int, db: Session) -> dict:
         sampled_set.add(total_ts - 1)
 
     last_read_frame = -1
+    has_reid = bool(player_reid) and reid_extractor is not None
 
     for ts_idx, ts in enumerate(all_timestamps):
         detections = frames_by_ts[ts]
@@ -233,12 +289,20 @@ def correct_identities(match_id: int, db: Session) -> dict:
                 n_det = len(team_det_indices)
                 cost = np.full((n_players, n_det), 1.0, dtype=np.float64)
 
+                # Extract appearance features for detections
                 det_hists = {}
+                det_reid_feats = {}
                 if frame is not None:
                     for di, det_i in enumerate(team_det_indices):
                         det = detections[det_i]
                         crop = _extract_torso_crop(frame, det.bbox_x, det.bbox_y, det.bbox_w, det.bbox_h)
                         det_hists[di] = _get_color_hist(crop)
+                        # Extract ReID features for this detection
+                        if has_reid and crop is not None:
+                            feat = reid_extractor.extract_features(
+                                crop, det.bbox_w, det.bbox_h)
+                            if feat is not None:
+                                det_reid_feats[di] = feat
 
                 for pi, pid in enumerate(player_ids):
                     state = player_state.get(pid)
@@ -249,6 +313,7 @@ def correct_identities(match_id: int, db: Session) -> dict:
                         pred_x, pred_y = None, None
 
                     for di, det_i in enumerate(team_det_indices):
+                        # ── Position cost (70%) ──────────────────────
                         if pred_x is not None:
                             pos_dist = _pos_distance(
                                 det_positions[det_i][0], det_positions[det_i][1],
@@ -262,11 +327,22 @@ def correct_identities(match_id: int, db: Session) -> dict:
                         else:
                             pos_dist = 0.5
 
+                        # ── ReID appearance cost (20%) ───────────────
+                        reid_dist = 0.5
+                        if has_reid and pid in player_reid and di in det_reid_feats:
+                            sim = float(np.dot(player_reid[pid], det_reid_feats[di]))
+                            reid_dist = 1.0 - max(0.0, sim)
+
+                        # ── Color histogram cost (10%) ───────────────
                         color_dist = 0.5
                         if pid in player_hists and di in det_hists:
                             color_dist = _hist_distance(det_hists[di], player_hists[pid])
 
-                        cost[pi, di] = POSITION_WEIGHT * pos_dist + COLOR_WEIGHT * color_dist
+                        cost[pi, di] = (
+                            POSITION_WEIGHT * pos_dist
+                            + REID_WEIGHT * reid_dist
+                            + COLOR_WEIGHT * color_dist
+                        )
 
                 try:
                     from scipy.optimize import linear_sum_assignment
@@ -294,6 +370,7 @@ def correct_identities(match_id: int, db: Session) -> dict:
                 }
 
         else:
+            # Non-sampled frames: position-only matching (fast)
             team_det_indices = list(range(len(detections)))
             if team_track_ids is not None:
                 team_det_indices = [i for i, det in enumerate(detections)

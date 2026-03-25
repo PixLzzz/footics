@@ -65,6 +65,7 @@ class Match(Base):
     width = Column(Integer, default=0)
     height = Column(Integer, default=0)
     status = Column(String, default=MatchStatus.UPLOADED)
+    field_homography = Column(String, nullable=True)  # JSON: 4 court corner points for bird's-eye view
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", foreign_keys=[team_id])

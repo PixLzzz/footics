@@ -1,12 +1,22 @@
 """
-Video analysis pipeline: YOLO detection + BoxMOT DeepOCSORT tracking with CLIPReID.
+Video analysis pipeline: YOLO detection + multi-object tracking + ReID.
 
-BoxMOT provides a real person re-identification model (CLIPReID) trained on person
-appearance features — far superior to ultralytics' built-in tracker for maintaining
-identity through occlusions and player crossings.
+Pipeline architecture:
+    1. YOLO v8s detection — persons (class 0) + ball (class 32)
+    2. Multi-object tracking — BoxMOT DeepOCSORT+CLIPReID or ultralytics BoT-SORT
+    3. ReID feature extraction — 142D appearance descriptors per track (during tracking)
+    4. Post-processing — track merging (appearance-aware), noise removal, confidence scoring
+    5. Trajectory smoothing — Savitzky-Golay offline smoothing
+    6. Team classification — brightness-based jersey separation
 
-After tracking, a team classification step uses SigLIP visual embeddings to
-separate the two teams, so only the user's team is shown.
+Design decisions:
+    - YOLOv8s (small) balances speed and accuracy for real-time processing
+    - BoxMOT DeepOCSORT is preferred (CLIPReID for re-identification), with
+      graceful fallback to ultralytics BoT-SORT if not installed
+    - ReID features are extracted DURING tracking (not as a separate pass)
+      to reuse the already-decoded video frames
+    - Post-processing uses ReID features for smarter track merging
+    - Static camera assumed (gmc_method: none) — no motion compensation needed
 """
 
 import cv2
@@ -17,6 +27,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from models import Match, TrackingFrame, BallFrame, MatchStatus
 import logging
+
+# Import tracker modules
+from tracker.reid import AppearanceExtractor, TrackGallery
+from tracker.smoother import TrajectorySmoother
+from tracker.postprocess import TrackPostProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +169,12 @@ def process_video(match_id: int, db: Session):
         track_batch = []
         ball_batch = []
 
+        # ── ReID: Initialize appearance extractor and gallery ──────────
+        # Features are extracted DURING tracking to reuse decoded frames.
+        # This avoids a second pass over the video.
+        reid_extractor = AppearanceExtractor()
+        reid_gallery = TrackGallery()
+
         analysis_progress[match_id] = {"current": 0, "total": total_frames, "percent": 0}
         analysis_cancel.discard(match_id)
 
@@ -238,6 +259,11 @@ def process_video(match_id: int, db: Session):
                                 if nw > 0.25 or nh > 0.7:
                                     continue
 
+                                # Extract ReID appearance features for this detection
+                                feat = reid_extractor.extract_from_frame(
+                                    frame, nx, ny, nw, nh)
+                                reid_gallery.update(tid, feat)
+
                                 track_batch.append(TrackingFrame(
                                     match_id=match_id, frame_number=frame_number,
                                     timestamp_seconds=round(timestamp, 3),
@@ -277,6 +303,11 @@ def process_video(match_id: int, db: Session):
                             if nw > 0.25 or nh > 0.7:
                                 continue
 
+                            # Extract ReID appearance features for this detection
+                            feat = reid_extractor.extract_from_frame(
+                                frame, nx, ny, nw, nh)
+                            reid_gallery.update(tid, feat)
+
                             track_batch.append(TrackingFrame(
                                 match_id=match_id, frame_number=frame_number,
                                 timestamp_seconds=round(timestamp, 3),
@@ -315,22 +346,43 @@ def process_video(match_id: int, db: Session):
             db.bulk_save_objects(ball_batch)
         db.commit()
 
-        # Post-processing
+        # ── Post-processing pipeline ────────────────────────────────────
+        post = TrackPostProcessor(fps=fps)
+
+        # Phase 1: Appearance-aware track merging
         analysis_progress[match_id] = {
             "current": total_frames, "total": total_frames,
-            "percent": 92, "phase": "Fusion des tracks fragmentés...",
+            "percent": 88, "phase": "Fusion des tracks (apparence)...",
         }
-        merge_count = _merge_fragmented_tracks(match_id, db)
+        merge_count = _merge_fragmented_tracks(match_id, db, reid_gallery)
         if merge_count:
             logger.info(f"Match {match_id}: merged {merge_count} fragmented tracks")
 
-        # Remove short noise tracks (< 15 frames)
-        _remove_noise_tracks(match_id, db, min_frames=15)
-
-        # ── Team classification using SigLIP ──────────────────────────────
+        # Phase 2: Remove short noise tracks
         analysis_progress[match_id] = {
             "current": total_frames, "total": total_frames,
-            "percent": 95, "phase": "Classification des équipes...",
+            "percent": 90, "phase": "Suppression du bruit...",
+        }
+        _remove_noise_tracks(match_id, db, min_frames=15)
+
+        # Phase 3: Trajectory smoothing (reduces jitter in stored positions)
+        analysis_progress[match_id] = {
+            "current": total_frames, "total": total_frames,
+            "percent": 92, "phase": "Lissage des trajectoires...",
+        }
+        _smooth_all_tracks(match_id, db)
+
+        # Phase 4: Compute and log track confidence scores
+        analysis_progress[match_id] = {
+            "current": total_frames, "total": total_frames,
+            "percent": 94, "phase": "Scores de confiance...",
+        }
+        _compute_track_confidences(match_id, db, post, reid_gallery)
+
+        # Phase 5: Team classification
+        analysis_progress[match_id] = {
+            "current": total_frames, "total": total_frames,
+            "percent": 96, "phase": "Classification des équipes...",
         }
         try:
             from team_classifier import classify_teams
@@ -340,6 +392,9 @@ def process_video(match_id: int, db: Session):
             logger.warning(f"Team classification failed: {e}")
             import traceback
             traceback.print_exc()
+
+        # Save ReID gallery for later use (identity correction, auto-assign)
+        _save_reid_gallery(match_id, reid_gallery)
 
         match.status = MatchStatus.ANALYZED
         db.commit()
@@ -378,14 +433,24 @@ def _remove_noise_tracks(match_id: int, db: Session, min_frames: int = 15):
         logger.info(f"Match {match_id}: removed {len(short_ids)} noise tracks (<{min_frames} frames)")
 
 
-def _merge_fragmented_tracks(match_id: int, db: Session) -> int:
+def _merge_fragmented_tracks(match_id: int, db: Session,
+                              reid_gallery: TrackGallery = None) -> int:
     """Merge fragmented tracks that likely belong to the same person.
 
-    STRICT rules to prevent merging different people:
-      - Track A must END before track B STARTS (no temporal overlap at all)
+    Two-pass approach:
+      Pass 1 (appearance-aware): If ReID gallery is available, merge tracks
+              that have HIGH appearance similarity AND are close in space/time.
+              This allows slightly larger spatial gaps because we're confident
+              they're the same person based on appearance.
+      Pass 2 (position-only): Merge remaining tracks using strict position rules.
+
+    Rules (both passes):
+      - Track A must END before track B STARTS (no temporal overlap)
       - Gap between A end and B start must be < MERGE_MAX_GAP_S
       - Last position of A must be close to first position of B
     """
+    from tracker.reid import cosine_similarity
+
     track_info = (
         db.query(
             TrackingFrame.track_id,
@@ -447,14 +512,30 @@ def _merge_fragmented_tracks(match_id: int, db: Session) -> int:
                 continue
 
             dist = ((last_pos_a[0] - first_pos_b[0]) ** 2 + (last_pos_a[1] - first_pos_b[1]) ** 2) ** 0.5
-            if dist < MERGE_MAX_DISTANCE:
-                merge_pairs.append((dist, gap, tid_a, tid_b))
+
+            # Check appearance similarity if gallery available
+            appearance_sim = 0.0
+            if reid_gallery:
+                desc_a = reid_gallery.get_descriptor(tid_a)
+                desc_b = reid_gallery.get_descriptor(tid_b)
+                if desc_a is not None and desc_b is not None:
+                    appearance_sim = cosine_similarity(desc_a, desc_b)
+
+            # Appearance-aware: relax distance threshold if high appearance match
+            effective_max_dist = MERGE_MAX_DISTANCE
+            if appearance_sim > 0.6:
+                effective_max_dist = MERGE_MAX_DISTANCE * 1.5  # Allow 50% more distance
+
+            if dist < effective_max_dist:
+                # Combined score: lower = better merge candidate
+                score = dist * (1.0 - 0.5 * appearance_sim)
+                merge_pairs.append((score, dist, gap, appearance_sim, tid_a, tid_b))
 
     merge_pairs.sort()
     used = set()
     merge_count = 0
 
-    for dist, gap, tid_a, tid_b in merge_pairs:
+    for score, dist, gap, app_sim, tid_a, tid_b in merge_pairs:
         if tid_a in used or tid_b in used:
             continue
 
@@ -477,9 +558,146 @@ def _merge_fragmented_tracks(match_id: int, db: Session) -> int:
                 "first_ts": min(info_a["first_ts"], info_b["first_ts"]),
                 "last_ts": max(info_a["last_ts"], info_b["last_ts"]),
             }
-            logger.info(f"Merged track {frag} into {keep} (dist={dist:.4f}, gap={gap:.2f}s)")
+            logger.info(
+                f"Merged track {frag} into {keep} "
+                f"(dist={dist:.4f}, gap={gap:.2f}s, appearance={app_sim:.2f})"
+            )
 
     if merge_count:
         db.commit()
 
     return merge_count
+
+
+def _smooth_all_tracks(match_id: int, db: Session):
+    """Apply trajectory smoothing to all tracks in the database.
+
+    Uses Savitzky-Golay filter to reduce position jitter while preserving
+    sharp direction changes (important for dribble detection).
+    """
+    smoother = TrajectorySmoother(window_size=7, poly_order=2)
+
+    track_ids = (
+        db.query(TrackingFrame.track_id)
+        .filter(TrackingFrame.match_id == match_id)
+        .distinct()
+        .all()
+    )
+
+    smoothed_count = 0
+    for (tid,) in track_ids:
+        frames = (
+            db.query(TrackingFrame)
+            .filter_by(match_id=match_id, track_id=tid)
+            .order_by(TrackingFrame.timestamp_seconds)
+            .all()
+        )
+
+        if len(frames) < 7:  # Too short for smoothing window
+            continue
+
+        # Extract center positions
+        positions = [
+            (f.bbox_x + f.bbox_w / 2, f.bbox_y + f.bbox_h / 2)
+            for f in frames
+        ]
+
+        smoothed = smoother.smooth_trajectory(positions)
+
+        # Apply smoothed centers back (preserve bbox dimensions)
+        for i, f in enumerate(frames):
+            cx, cy = smoothed[i]
+            new_x = cx - f.bbox_w / 2
+            new_y = cy - f.bbox_h / 2
+            # Only update if change is significant (avoid unnecessary writes)
+            if abs(new_x - f.bbox_x) > 0.0005 or abs(new_y - f.bbox_y) > 0.0005:
+                f.bbox_x = round(new_x, 4)
+                f.bbox_y = round(new_y, 4)
+                smoothed_count += 1
+
+    db.commit()
+    logger.info(f"Match {match_id}: smoothed {smoothed_count} positions across {len(track_ids)} tracks")
+
+
+def _compute_track_confidences(match_id: int, db: Session,
+                                post: TrackPostProcessor,
+                                reid_gallery: TrackGallery):
+    """Compute and log confidence scores for all tracks.
+
+    Confidence scores are stored in a JSON file alongside team labels.
+    They help the user prioritize which tracks to assign manually.
+    """
+    import json
+
+    track_ids = (
+        db.query(TrackingFrame.track_id)
+        .filter(TrackingFrame.match_id == match_id)
+        .distinct()
+        .all()
+    )
+
+    confidences = {}
+    for (tid,) in track_ids:
+        frames = (
+            db.query(TrackingFrame)
+            .filter_by(match_id=match_id, track_id=tid)
+            .all()
+        )
+        frame_dicts = [{
+            "timestamp_seconds": f.timestamp_seconds,
+            "bbox_x": f.bbox_x, "bbox_y": f.bbox_y,
+            "bbox_w": f.bbox_w, "bbox_h": f.bbox_h,
+            "confidence": f.confidence,
+        } for f in frames]
+
+        score = post.compute_track_confidence(
+            frame_dicts, gallery=reid_gallery, track_id=tid)
+        confidences[str(tid)] = score
+
+    # Save to disk
+    path = f"./data/track_confidence_{match_id}.json"
+    with open(path, "w") as f:
+        json.dump(confidences, f)
+
+    high_conf = sum(1 for s in confidences.values() if s > 0.5)
+    logger.info(
+        f"Match {match_id}: {len(confidences)} tracks scored, "
+        f"{high_conf} high-confidence (>0.5)"
+    )
+
+
+def _save_reid_gallery(match_id: int, gallery: TrackGallery):
+    """Save ReID gallery descriptors to disk for later use.
+
+    The identity corrector and auto-assigner can load these to improve
+    their matching without re-extracting features from video.
+    """
+    import json
+
+    descriptors = {}
+    for tid in gallery.track_ids:
+        desc = gallery.get_descriptor(tid)
+        if desc is not None:
+            descriptors[str(tid)] = desc.tolist()
+
+    path = f"./data/reid_gallery_{match_id}.json"
+    with open(path, "w") as f:
+        json.dump(descriptors, f)
+
+    logger.info(f"Match {match_id}: saved ReID gallery ({len(descriptors)} tracks)")
+
+
+def load_reid_gallery(match_id: int) -> dict:
+    """Load saved ReID gallery descriptors from disk.
+
+    Returns dict of track_id (int) → feature vector (np.ndarray).
+    """
+    import json
+
+    path = f"./data/reid_gallery_{match_id}.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {int(k): np.array(v, dtype=np.float32) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
