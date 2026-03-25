@@ -312,6 +312,10 @@ def analyze_match(match_id: int, db: Session = Depends(get_db)):
     if match.status == MatchStatus.PROCESSING:
         raise HTTPException(400, "Analysis already in progress")
 
+    # Reset status so analysis can restart (handles error/analyzed states)
+    match.status = MatchStatus.PROCESSING
+    db.commit()
+
     from database import SessionLocal
 
     def run_analysis():
@@ -359,10 +363,9 @@ def get_analysis_progress(match_id: int, db: Session = Depends(get_db)):
 @app.post("/api/matches/{match_id}/detect-events")
 def auto_detect_events(
     match_id: int,
-    attacks_right: bool = Form(True),
     db: Session = Depends(get_db),
 ):
-    """Auto-detect match events from tracking + ball data."""
+    """Auto-detect match events from tracking + ball data (camera-angle agnostic)."""
     from event_detector import detect_events
     match = db.query(Match).filter(Match.id == match_id).first()
     if not match:
@@ -380,7 +383,7 @@ def auto_detect_events(
     if assign_count == 0:
         raise HTTPException(400, "Assignez d'abord les joueurs aux tracks détectés.")
 
-    events = detect_events(match_id, db, attacks_right=attacks_right)
+    events = detect_events(match_id, db)
     return {
         "count": len(events),
         "events": [
@@ -389,6 +392,16 @@ def auto_detect_events(
             for e in events
         ],
     }
+
+
+@app.get("/api/matches/{match_id}/team-labels")
+def get_team_labels_endpoint(match_id: int, db: Session = Depends(get_db)):
+    """Get team classification labels for all tracks."""
+    from team_classifier import get_team_labels
+    labels = get_team_labels(match_id)
+    if not labels:
+        return {"labels": {}, "message": "No team classification available"}
+    return {"labels": {str(k): v for k, v in labels.items()}}
 
 
 @app.get("/api/matches/{match_id}/ball-stats")
@@ -485,11 +498,20 @@ def get_tracking_bulk(
                     "team_name": player.team.name,
                 }
 
+    # Load team labels for overlay coloring
+    try:
+        from team_classifier import get_team_labels
+        team_labels = get_team_labels(match_id)
+        team_labels_str = {str(k): v for k, v in team_labels.items()}
+    except Exception:
+        team_labels_str = {}
+
     return {
         "timestamps": timestamps,
         "frames": grouped,
         "assignments": assignments,
         "referee_tracks": referee_tracks,
+        "team_labels": team_labels_str,
         "start": start,
         "end": end,
     }
@@ -577,6 +599,21 @@ def unassign_track(
     deleted = (
         db.query(TrackAssignment)
         .filter(TrackAssignment.match_id == match_id, TrackAssignment.track_id == track_id)
+        .delete()
+    )
+    db.commit()
+    return {"ok": True, "deleted": deleted}
+
+
+@app.delete("/api/matches/{match_id}/unassign-all")
+def unassign_all_tracks(
+    match_id: int,
+    db: Session = Depends(get_db),
+):
+    """Remove ALL track-player assignments for a match."""
+    deleted = (
+        db.query(TrackAssignment)
+        .filter(TrackAssignment.match_id == match_id)
         .delete()
     )
     db.commit()
@@ -676,6 +713,64 @@ def get_track_thumbnail(
 
     _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return Response(content=buf.tobytes(), media_type="image/jpeg")
+
+# ─── Identity Correction ────────────────────────────────────────────────────
+
+@app.post("/api/matches/{match_id}/correct-identities")
+def correct_identities_endpoint(
+    match_id: int,
+    db: Session = Depends(get_db),
+):
+    """Re-identify all detections frame-by-frame using player appearance (background thread)."""
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.status != "analyzed":
+        raise HTTPException(400, "Match must be analyzed first")
+
+    from identity_corrector import correction_progress
+    prog = correction_progress.get(match_id)
+    if prog and not prog.get("done", True) and prog.get("percent", 0) > 0:
+        raise HTTPException(400, "Correction déjà en cours")
+
+    correction_progress[match_id] = {
+        "percent": 0, "phase": "Démarrage...", "done": False,
+    }
+
+    from database import SessionLocal
+
+    def run_correction():
+        session = SessionLocal()
+        try:
+            from identity_corrector import correct_identities
+            result = correct_identities(match_id, session)
+            correction_progress[match_id] = {
+                "percent": 100, "phase": "Terminé", "done": True,
+                "corrected": result.get("corrected_count", 0),
+                "message": result.get("error", ""),
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            correction_progress[match_id] = {
+                "percent": 100, "phase": f"Erreur: {e}", "done": True, "error": str(e),
+            }
+        finally:
+            session.close()
+
+    thread = threading.Thread(target=run_correction, daemon=True)
+    thread.start()
+
+    return {"status": "processing", "message": "Correction des identités lancée"}
+
+
+@app.get("/api/matches/{match_id}/correction-progress")
+def get_correction_progress(match_id: int):
+    from identity_corrector import correction_progress
+    return correction_progress.get(match_id, {
+        "percent": 0, "phase": "", "done": True,
+    })
+
 
 # ─── Track ↔ Player Assignment ──────────────────────────────────────────────
 

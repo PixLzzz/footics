@@ -2,9 +2,9 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   getMatch, getEvents, createEvent, deleteEvent,
-  analyzeMatch, cancelAnalysis, getAnalysisProgress, getTracks, assignTrack, autoAssignTracks, unassignTrack, markReferee,
+  analyzeMatch, cancelAnalysis, getAnalysisProgress, getTracks, assignTrack, autoAssignTracks, unassignTrack, unassignAllTracks, markReferee,
   getPlayers, detectEvents, getBallStats, getTrackingBulk,
-  getAutoAssignProgress,
+  getAutoAssignProgress, correctIdentities, getCorrectionProgress,
   videoUrl,
 } from '../api'
 import {
@@ -58,6 +58,8 @@ export default function MatchDetail() {
   const [autoAssigning, setAutoAssigning] = useState(false)
   const [autoAssignProgress, setAutoAssignProgress] = useState(null)
   const [autoAssignResult, setAutoAssignResult] = useState(null)
+  const [correcting, setCorrecting] = useState(false)
+  const [correctionProgress, setCorrectionProgress] = useState(null)
 
   // Overlay state
   const [overlayEnabled, setOverlayEnabled] = useState(true)
@@ -172,15 +174,19 @@ export default function MatchDetail() {
     if (tsBefore === null) return []
 
     const beforeBoxes = chunk.frames[tsBefore] || []
-    const { assignments, referee_tracks } = chunk
+    const { assignments, referee_tracks, team_labels } = chunk
 
-    // Annotate boxes with player/referee info
+    // Annotate boxes with player/referee/team info
     const annotate = (box) => {
       const result = { ...box }
       if (referee_tracks.includes(box.track_id)) {
         result.is_referee = true
       } else if (assignments[String(box.track_id)]) {
         result.player = assignments[String(box.track_id)]
+      }
+      // Attach team label if available
+      if (team_labels && team_labels[String(box.track_id)] !== undefined) {
+        result.team_label = team_labels[String(box.track_id)]
       }
       return result
     }
@@ -374,18 +380,22 @@ export default function MatchDetail() {
         ctx.fillStyle = '#fff'
         ctx.fillText(label, x + 5, Math.max(0, labelY) + 13)
       } else {
-        // Unassigned — dashed gray box
-        ctx.strokeStyle = 'rgba(148, 163, 184, 0.5)'
+        // Unassigned — color by team label if available
+        const TEAM_COLORS = ['rgba(59, 130, 246, 0.6)', 'rgba(239, 68, 68, 0.6)', 'rgba(250, 204, 21, 0.5)']
+        const teamColor = box.team_label !== undefined ? TEAM_COLORS[box.team_label] || TEAM_COLORS[0] : 'rgba(148, 163, 184, 0.5)'
+
+        ctx.strokeStyle = teamColor
         ctx.lineWidth = 1.5
         ctx.setLineDash([5, 5])
         ctx.strokeRect(x, y, bWidth, bHeight)
         ctx.setLineDash([])
 
-        // Small track ID
+        // Team label indicator + track ID
         if (assignMode) {
-          ctx.fillStyle = 'rgba(148, 163, 184, 0.7)'
+          const labelText = box.team_label !== undefined ? `T${box.team_label} #${box.track_id}` : `#${box.track_id}`
+          ctx.fillStyle = teamColor
           ctx.font = '9px system-ui'
-          ctx.fillText(`#${box.track_id}`, x + 2, y + bHeight - 3)
+          ctx.fillText(labelText, x + 2, y + bHeight - 3)
         }
       }
     }
@@ -439,43 +449,47 @@ export default function MatchDetail() {
   // ── Canvas click handling (assign mode) ──────────────────────────────
 
   const handleCanvasClick = (e) => {
-    if (!assignMode) return
-
     const canvas = canvasRef.current
     const rect = canvas.getBoundingClientRect()
     const clickX = (e.clientX - rect.left) / rect.width
     const clickY = (e.clientY - rect.top) / rect.height
-
-    // Pause video
-    if (videoRef.current && !videoRef.current.paused) {
-      videoRef.current.pause()
-    }
 
     // Find clicked box
     let clicked = null
     for (const box of overlayBoxes) {
       const [bx, by, bw, bh] = box.bbox
       if (clickX >= bx && clickX <= bx + bw && clickY >= by && clickY <= by + bh) {
-        // Prefer the smallest box (most precise)
         if (!clicked || (bw * bh < clicked.bbox[2] * clicked.bbox[3])) {
           clicked = box
         }
       }
     }
 
-    if (clicked) {
-      // Show popup near the click
-      setAssignPopup({
-        screenX: e.clientX - rect.left,
-        screenY: e.clientY - rect.top,
-        trackId: clicked.track_id,
-        bbox: clicked.bbox,
-        player: clicked.player || null,
-        isReferee: clicked.is_referee || false,
-      })
-    } else {
+    if (!clicked) {
       setAssignPopup(null)
+      return
     }
+
+    // Always allow clicking on assigned players (to re-assign)
+    // For unassigned boxes, require assign mode
+    if (!assignMode && !clicked.player && !clicked.is_referee) {
+      setAssignPopup(null)
+      return
+    }
+
+    // Pause video
+    if (videoRef.current && !videoRef.current.paused) {
+      videoRef.current.pause()
+    }
+
+    setAssignPopup({
+      screenX: e.clientX - rect.left,
+      screenY: e.clientY - rect.top,
+      trackId: clicked.track_id,
+      bbox: clicked.bbox,
+      player: clicked.player || null,
+      isReferee: clicked.is_referee || false,
+    })
   }
 
   const handleMarkReferee = async (trackId) => {
@@ -523,14 +537,32 @@ export default function MatchDetail() {
   }
 
   const handleAnalyze = async () => {
-    await analyzeMatch(id)
-    setMatch({ ...match, status: 'processing' })
+    try {
+      await analyzeMatch(id)
+      setMatch({ ...match, status: 'processing' })
+    } catch (err) {
+      alert('Erreur: ' + err.message)
+    }
   }
 
   const handleCancelAnalysis = async () => {
     try {
       await cancelAnalysis(id)
     } catch { /* ignore */ }
+  }
+
+  const handleResetAssignments = async () => {
+    if (!confirm('Supprimer toutes les assignations de joueurs ?')) return
+    try {
+      await unassignAllTracks(id)
+      setAutoAssignResult(null)
+      const tr = await getTracks(id, 30)
+      setTracks(tr)
+      // Clear bulk cache so overlay refreshes
+      bulkCache.current = []
+    } catch (err) {
+      alert(err.message)
+    }
   }
 
   const handleAutoAssign = async () => {
@@ -544,6 +576,37 @@ export default function MatchDetail() {
       setAutoAssigning(false)
     }
   }
+
+  // ── Identity correction ──────────────────────────────────────────
+  const handleCorrectIdentities = async () => {
+    setCorrecting(true)
+    setCorrectionProgress(null)
+    try {
+      await correctIdentities(id)
+    } catch (err) {
+      setCorrectionProgress({ done: true, error: err.message })
+      setCorrecting(false)
+    }
+  }
+
+  // Correction progress polling
+  useEffect(() => {
+    if (!correcting) return
+    const interval = setInterval(async () => {
+      try {
+        const p = await getCorrectionProgress(id)
+        setCorrectionProgress(p)
+        if (p.done || p.percent >= 100) {
+          clearInterval(interval)
+          const tr = await getTracks(id, 30)
+          setTracks(tr)
+          bulkCache.current = []
+          setCorrecting(false)
+        }
+      } catch { /* ignore */ }
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [correcting, id])
 
   // Auto-assign progress polling
   useEffect(() => {
@@ -675,7 +738,7 @@ export default function MatchDetail() {
                 <canvas
                   ref={canvasRef}
                   className={`absolute inset-0 w-full h-full ${
-                    assignMode ? 'cursor-crosshair' : 'pointer-events-none'
+                    assignMode ? 'cursor-crosshair' : 'cursor-pointer'
                   }`}
                   onClick={handleCanvasClick}
                 />
@@ -956,14 +1019,23 @@ export default function MatchDetail() {
                     </button>
                   )}
 
-                  {/* Auto-assign button + progress */}
+                  {/* Auto-assign button + reset + progress */}
                   {assignedCount > 0 && !autoAssigning && (
-                    <button
-                      onClick={handleAutoAssign}
-                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-xl text-blue-300 text-sm font-medium transition-colors"
-                    >
-                      <Zap size={15} /> Auto-assigner par apparence
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleAutoAssign}
+                        className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-xl text-blue-300 text-sm font-medium transition-colors"
+                      >
+                        <Zap size={15} /> Auto-assigner
+                      </button>
+                      <button
+                        onClick={handleResetAssignments}
+                        className="flex items-center justify-center gap-2 px-3 py-2.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 rounded-xl text-red-400 text-sm font-medium transition-colors"
+                        title="Supprimer toutes les assignations"
+                      >
+                        <Trash2 size={15} /> Reset
+                      </button>
+                    </div>
                   )}
                   {autoAssigning && autoAssignProgress && (
                     <div className="space-y-2 p-3 bg-slate-800/60 rounded-xl">
@@ -1001,6 +1073,36 @@ export default function MatchDetail() {
                           ? autoAssignResult.message
                           : `${autoAssignResult.assigned_count} tracks auto-assignés`
                       }
+                    </div>
+                  )}
+
+                  {/* Identity correction button + progress */}
+                  {assignedCount >= 2 && !correcting && !autoAssigning && (
+                    <button
+                      onClick={handleCorrectIdentities}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded-xl text-emerald-300 text-sm font-medium transition-colors"
+                      title="Ré-identifie chaque joueur frame par frame en utilisant la couleur du maillot"
+                    >
+                      <Target size={15} /> Corriger les identités (haute précision)
+                    </button>
+                  )}
+                  {correcting && (
+                    <div className="space-y-2 p-3 bg-slate-800/60 rounded-xl">
+                      <div className="flex items-center gap-2">
+                        <Loader size={14} className="animate-spin text-emerald-400 shrink-0" />
+                        <span className="text-xs text-emerald-300 flex-1 truncate">
+                          {correctionProgress?.phase || 'Démarrage...'}
+                        </span>
+                        <span className="text-xs font-mono text-emerald-400">
+                          {correctionProgress?.percent || 0}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-700 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-gradient-to-r from-emerald-500 to-emerald-400 h-full rounded-full transition-all duration-500"
+                          style={{ width: `${correctionProgress?.percent || 0}%` }}
+                        />
+                      </div>
                     </div>
                   )}
 

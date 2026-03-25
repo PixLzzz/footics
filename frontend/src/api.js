@@ -62,7 +62,14 @@ export const markReferee = (matchId, trackId) =>
   request(`/matches/${matchId}/assign-track`, { method: 'POST', body: formData({ track_id: trackId, is_referee: true }) });
 export const unassignTrack = (matchId, trackId) =>
   request(`/matches/${matchId}/unassign-track?track_id=${trackId}`, { method: 'DELETE' });
+export const unassignAllTracks = (matchId) =>
+  request(`/matches/${matchId}/unassign-all`, { method: 'DELETE' });
+export const correctIdentities = (matchId) =>
+  request(`/matches/${matchId}/correct-identities`, { method: 'POST' });
+export const getCorrectionProgress = (matchId) =>
+  request(`/matches/${matchId}/correction-progress`);
 export const getTrackingAt = (matchId, t) => request(`/matches/${matchId}/tracking-at?t=${t}`);
+export const getTeamLabels = (matchId) => request(`/matches/${matchId}/team-labels`);
 
 // Events
 export const getEvents = (matchId) => request(`/matches/${matchId}/events`);

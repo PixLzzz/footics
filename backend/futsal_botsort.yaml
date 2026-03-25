@@ -1,16 +1,16 @@
-# Custom BoT-SORT config optimized for futsal (5v5)
-# Players are closer together, more occlusions, frequent direction changes
+# BoT-SORT config for futsal with ReID (appearance-based re-identification)
+# ReID prevents ID swaps when players cross paths or get occluded
 
 tracker_type: botsort
-track_high_thresh: 0.20        # Lower than default (0.25) — catch more detections
-track_low_thresh: 0.08         # Lower for second association pass
-new_track_thresh: 0.30         # Slightly higher — avoid creating noise tracks
-track_buffer: 90               # 3x default (30) — keep lost tracks alive longer through occlusions
-match_thresh: 0.85             # Slightly more permissive matching
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.50
+track_buffer: 150              # 5s at 30fps — keep lost tracks alive when players leave/return
+match_thresh: 0.80
 fuse_score: True
 
-# BoT-SORT settings
-gmc_method: sparseOptFlow      # Camera motion compensation (important for handheld footage)
+# BoT-SORT specific
+gmc_method: none               # Static camera — GMC disabled (adds noise on fixed cam)
 proximity_thresh: 0.5
-appearance_thresh: 0.25
-with_reid: False
+appearance_thresh: 0.30        # ReID matching threshold (lower = stricter)
+with_reid: True                # ENABLED — uses appearance model to maintain IDs through crossings

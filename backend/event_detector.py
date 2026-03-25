@@ -1,20 +1,25 @@
 """
-Automatic event detection from player tracking + ball tracking data.
+Conservative event detection for five-a-side futsal.
 
-Single-team analysis: detects events for the tracked team only.
-Detects: passes, interceptions, shots, goals, assists, key passes, dribbles.
+Camera-angle agnostic: works with side view, behind-goal, or any angle.
 
-Pipeline:
-  1. Load & index tracking data
-  2. Interpolate ball positions to fill gaps (ball detected in ~40% of frames)
-  3. Build possession timeline with hysteresis (anti-flicker)
-  4. Compute ball velocity between frames
-  5. Derive events from possession changes + ball trajectory
-  6. Second pass: confirm goals via ball disappearance
-  7. Post-processing: remove shot→goal duplicates, detect assists & key passes
+Philosophy: FEWER events but ACCURATE. Every detected event should be real.
+Ball detection is unreliable — we require high confidence and corroborating signals.
+
+Detected events:
+  - pass: Possession switches between two assigned teammates with ball movement
+  - shot: Ball accelerates significantly while a player has possession
+  - goal: Multi-signal (shot + ball disappearance + team convergence + play stoppage)
+  - assist: Last pass before a goal
+  - dribble: Player maintains possession while covering distance with direction changes
+
+NOT auto-detected (too unreliable):
+  - interception, tackle, foul, key_pass
 """
 
 import logging
+import bisect
+import math
 from sqlalchemy.orm import Session
 from models import (
     Match, Player, TrackingFrame, BallFrame,
@@ -23,220 +28,207 @@ from models import (
 
 logger = logging.getLogger(__name__)
 
-# ── Thresholds tuned for futsal / five-a-side ────────────────────────────────
-# Futsal: smaller field, players closer together, faster ball movement.
-# All distances in normalized 0-1 coordinates.
+# ── Thresholds ───────────────────────────────────────────────────────────────
+
+# Ball confidence: only trust detections above this
+BALL_MIN_CONFIDENCE = 0.30
 
 # Possession
-POSSESSION_DIST = 0.08            # Tighter than 11v11 — players closer to ball in futsal
-POSSESSION_HYSTERESIS = 3         # 3 consecutive frames before switching (anti-flicker)
-POSSESSION_STICKY_BONUS = 0.020   # Strong sticky bonus — fewer false switches
-POSSESSION_MIN_DURATION = 0.4     # Slightly longer to filter noise
+POSSESSION_RADIUS = 0.065
+POSSESSION_HYSTERESIS = 5
+POSSESSION_STICKY_BONUS = 0.025
+POSSESSION_MIN_SECONDS = 0.5
 
-# Passes
-PASS_MIN_BALL_TRAVEL = 0.04       # Shorter passes in futsal are valid
-EVENT_COOLDOWN = 1.5              # Faster pace → shorter cooldown
+# Pass
+PASS_MIN_BALL_TRAVEL = 0.05
+PASS_MAX_BALL_TRAVEL = 0.50       # futsal court is small — reject huge jumps (noise)
+PASS_MAX_PLAYER_DIST = 0.50       # tighter for futsal
+PASS_COOLDOWN = 2.0
 
-# Shots & Goals
-GOAL_ZONE_X = 0.08               # Wider goal zone — futsal goals take up more of the frame
-GOAL_Y_MIN = 0.15                # Wider vertical range for goal detection
-GOAL_Y_MAX = 0.85
-SHOT_ZONE_X = 0.30               # Larger shot zone — in futsal you shoot from further relative to field
-SHOT_MIN_SPEED = 0.025           # Lower threshold — smaller field = lower absolute speed
-GOAL_DISAPPEAR_MIN = 0.25        # Ball vanishes faster in futsal (net catch)
+# Shot: ball speed spike (camera-angle agnostic — just uses total speed)
+SHOT_MIN_SPEED = 0.06
+SHOT_SPEED_RATIO = 2.5
+SHOT_COOLDOWN = 4.0
 
-# Dribbles
-DRIBBLE_MIN_PLAYER_TRAVEL = 0.05 # Less travel needed — field is smaller
-DRIBBLE_MIN_DURATION = 1.2       # Shorter dribbles count
+# Goal: multi-signal detection
+GOAL_DISAPPEAR_MIN = 0.8          # ball vanishes 0.8s+ after shot
+GOAL_CONVERGENCE_RADIUS = 0.15    # players converge within this radius
+GOAL_CONVERGENCE_MIN = 3          # at least 3 teammates converge
+GOAL_STOPPAGE_SPEED = 0.005       # avg team speed below this = stoppage
+GOAL_SIGNAL_MIN = 2               # require at least 2 signals out of 3
+GOAL_COOLDOWN = 15.0
 
-# Assists & key passes
-ASSIST_WINDOW = 10.0             # Faster play → shorter assist window
-KEY_PASS_WINDOW = 8.0
+# Dribble — futsal-specific (shorter distances, faster game)
+DRIBBLE_MIN_DURATION = 1.5        # shorter for futsal (was 2.5)
+DRIBBLE_MIN_TRAVEL = 0.06         # shorter for futsal (was 0.10)
+DRIBBLE_MIN_DIRECTION_CHANGES = 1 # require at least 1 direction change
+DRIBBLE_DIRECTION_ANGLE = 45      # degrees — change > this counts
+DRIBBLE_COOLDOWN = 3.0
+
+# Assist
+ASSIST_WINDOW = 8.0
 
 # Ball interpolation
-INTERP_GAP_MAX_CONFIDENT = 2.5   # Slightly more generous for noisy ball detection
-INTERP_GAP_MAX_LOW_CONF = 6.0    # Allow longer interpolation gaps
+INTERP_LINEAR_MAX_GAP = 1.5       # linear interpolation for short gaps
+INTERP_SPLINE_MAX_GAP = 3.5       # spline interpolation for medium gaps
 
 
-# ── Main entry point ─────────────────────────────────────────────────────────
-
-def detect_events(match_id: int, db: Session, attacks_right: bool = True) -> list[dict]:
-    """
-    Analyze tracking + ball data to auto-detect match events for the tracked team.
-
-    Returns list of detected events as dicts.
-    """
+def detect_events(match_id: int, db: Session, **kwargs) -> list[dict]:
+    """Detect match events from tracking + ball data. Camera-angle agnostic."""
     match = db.query(Match).filter_by(id=match_id).first()
     if not match:
         raise ValueError("Match not found")
 
-    # ── Load data ─────────────────────────────────────────────────────────
     assignments = _load_assignments(match_id, db)
     if not assignments:
-        raise ValueError("Aucun joueur assigné aux tracks. Assignez d'abord les joueurs.")
+        raise ValueError("Aucun joueur assigné aux tracks.")
 
-    player_by_ts, ball_by_ts = _load_tracking_data(match_id, db)
+    player_by_ts, ball_raw = _load_tracking_data(match_id, db)
+    all_ts = sorted(player_by_ts.keys())
 
-    all_player_ts = sorted(player_by_ts.keys())
-
-    if not all_player_ts:
-        logger.warning(f"Match {match_id}: no player tracking data")
+    if not all_ts:
         return []
 
-    # ── Interpolate ball positions to fill gaps ───────────────────────────
-    interpolated_ball = _interpolate_ball_positions(all_player_ts, ball_by_ts)
+    # Filter ball by confidence and interpolate gaps
+    ball_hq = {t: pos for t, (pos, conf) in ball_raw.items() if conf >= BALL_MIN_CONFIDENCE}
+    ball = _interpolate_ball(all_ts, ball_hq)
 
-    # Use ALL player timestamps (not just the intersection with ball)
-    timestamps = all_player_ts
-
-    ball_ts_set_original = set(ball_by_ts.keys())
-    n_original = len(ball_ts_set_original & set(all_player_ts))
-    n_interpolated = sum(1 for t in all_player_ts if t in interpolated_ball and t not in ball_ts_set_original)
-    n_none = sum(1 for t in all_player_ts if t not in interpolated_ball)
+    n_hq = len(ball_hq)
+    n_interp = len(ball) - n_hq
     logger.info(
-        f"Match {match_id}: {len(all_player_ts)} player frames, "
-        f"{n_original} with real ball, {n_interpolated} interpolated, "
-        f"{n_none} without ball data"
+        f"Match {match_id}: {len(all_ts)} frames, "
+        f"{n_hq} HQ ball, {n_interp} interpolated, "
+        f"{len(all_ts) - len(ball)} without ball"
     )
 
-    # Team attacks right → goal is at x=1.0; attacks left → goal at x=0.0
-    target_goal_x = 1.0 if attacks_right else 0.0
+    # Build possession timeline with direction tracking
+    possession = _build_possession(all_ts, player_by_ts, ball, assignments)
 
-    # ── Phase 1: Possession timeline with hysteresis ──────────────────────
-    possession_tl = _build_possession_timeline(
-        timestamps, player_by_ts, interpolated_ball, assignments
-    )
+    # Ball velocity
+    ball_ts = sorted(ball.keys())
+    velocity = _compute_velocity(ball_ts, ball)
 
-    # ── Phase 2: Ball velocity (only for timestamps with ball data) ──────
-    ts_with_ball = sorted(t for t in timestamps if t in interpolated_ball)
-    ball_velocity = _compute_ball_velocity(ts_with_ball, interpolated_ball)
+    # Rolling average speed for shot detection
+    avg_speed = _rolling_avg_speed(ball_ts, velocity, window=2.0)
 
-    # ── Phase 3: Ball gap map (for goal confirmation, uses original ball) ─
-    ball_gaps = _build_ball_gaps(all_player_ts, ball_ts_set_original)
+    # Ball detection timestamps (original, for disappearance detection)
+    ball_original_ts = set(ball_hq.keys())
 
-    # ── Phase 4: Derive events from timeline ──────────────────────────────
+    # ── Detect events ────────────────────────────────────────────────────
     events = []
-    last_events = {}  # (event_type, player_id) → last timestamp
-    pass_chain = []   # [(t, player_id, ball_x, ball_y)] for assists/key_pass
+    last_events = {}
+    pass_history = []
+    shot_history = []
 
-    prev = None
-    for entry in possession_tl:
+    prev_poss = None
+    for entry in possession:
         t = entry["t"]
+        tid = entry["possessor"]
         bx, by = entry["bx"], entry["by"]
-        track_id = entry["possessor"]
-        ball_known = entry.get("ball_known", True)
+        has_ball = entry["has_ball"]
+        poss_dur = entry["poss_duration"]
+        travel = entry["player_travel"]
 
-        if track_id is None or track_id not in assignments:
-            prev = entry
+        if tid is None or tid not in assignments:
+            prev_poss = entry
             continue
 
-        info = assignments[track_id]
-        pid = info["player_id"]
+        pid = assignments[tid]["player_id"]
 
-        # Skip ball-dependent logic when ball position is unknown
-        if not ball_known:
-            prev = entry
-            continue
+        # ── Pass detection ───────────────────────────────────────────
+        if (prev_poss and has_ball and prev_poss["has_ball"]
+                and prev_poss["possessor"] is not None
+                and prev_poss["possessor"] != tid
+                and prev_poss["possessor"] in assignments):
 
-        dist_to_goal = abs(bx - target_goal_x)
+            old_pid = assignments[prev_poss["possessor"]]["player_id"]
+            ball_travel = _dist(bx, by, prev_poss["bx"], prev_poss["by"])
 
-        # ── Possession change events ──────────────────────────────────
-        if (prev and prev["possessor"] is not None
-                and prev["possessor"] != track_id
-                and prev["possessor"] in assignments
-                and prev.get("ball_known", True)):
-            old = assignments[prev["possessor"]]
-            poss_dur = entry.get("poss_duration", 0)
+            if (PASS_MIN_BALL_TRAVEL <= ball_travel <= PASS_MAX_BALL_TRAVEL
+                    and poss_dur >= POSSESSION_MIN_SECONDS):
+                passer_pos = _find_player_pos(prev_poss["t"], prev_poss["possessor"], player_by_ts)
+                receiver_pos = _find_player_pos(t, tid, player_by_ts)
+                if passer_pos and receiver_pos:
+                    player_dist = _dist(*passer_pos, *receiver_pos)
+                    if player_dist <= PASS_MAX_PLAYER_DIST:
+                        added = _add_event(events, last_events, match_id,
+                                           old_pid, "pass", prev_poss["t"],
+                                           PASS_COOLDOWN, x=bx, y=by)
+                        if added:
+                            pass_history.append((prev_poss["t"], old_pid, bx, by))
 
-            if poss_dur >= POSSESSION_MIN_DURATION:
-                ball_travel = _dist(bx, by, prev["bx"], prev["by"])
+        # ── Shot detection (camera-angle agnostic) ───────────────────
+        if has_ball and t in velocity:
+            speed = velocity[t]
+            avg = avg_speed.get(t, 0.02)
 
-                # Both players are from the same team → PASS
-                if ball_travel >= PASS_MIN_BALL_TRAVEL:
-                    added = _add_event(events, last_events, match_id,
-                                       old["player_id"], "pass", t, EVENT_COOLDOWN,
-                                       x=bx, y=by)
-                    if added:
-                        pass_chain.append((t, old["player_id"], bx, by))
-            else:
-                # Very short possession by someone else then back → possible INTERCEPTION
-                # (ball was briefly contested, current player won it back)
-                _add_event(events, last_events, match_id,
-                           pid, "interception", t, EVENT_COOLDOWN,
-                           x=bx, y=by)
-
-        # ── Shot detection (ball moving fast toward goal) ─────────────
-        if GOAL_ZONE_X <= dist_to_goal < SHOT_ZONE_X:
-            speed = ball_velocity.get(t, 0)
-            speed_threshold = SHOT_MIN_SPEED
-            if dist_to_goal < SHOT_ZONE_X * 0.4:
-                speed_threshold *= 0.6  # easier to detect close shots
-
-            if speed >= speed_threshold:
+            if (speed >= SHOT_MIN_SPEED
+                    and (avg < 0.01 or speed >= avg * SHOT_SPEED_RATIO)):
                 added = _add_event(events, last_events, match_id,
-                                   pid, "shot", t, cooldown=3.0,
-                                   x=bx, y=by)
+                                   pid, "shot", t, SHOT_COOLDOWN, x=bx, y=by)
                 if added:
-                    # Key pass: last pass that led to this shot
-                    for pt, pp_id, px, py in reversed(pass_chain):
-                        if pp_id != pid and t - pt < KEY_PASS_WINDOW:
-                            _add_event(events, last_events, match_id,
-                                       pp_id, "key_pass", pt, cooldown=5.0,
-                                       x=px, y=py)
-                            break
+                    shot_history.append((t, pid, bx, by))
 
-        # ── Shot heuristic: possession near goal + ball disappears ────
-        if dist_to_goal < SHOT_ZONE_X and track_id in assignments:
-            # Look ahead: does ball disappear soon?
-            _check_shot_on_disappearance(
-                t, pid, bx, by, dist_to_goal, all_player_ts, ball_ts_set_original,
-                events, last_events, match_id, pass_chain
-            )
+        # ── Dribble detection (futsal-specific) ─────────────────────
+        if (has_ball
+                and poss_dur >= DRIBBLE_MIN_DURATION
+                and travel >= DRIBBLE_MIN_TRAVEL):
+            dir_changes = entry.get("direction_changes", 0)
+            if dir_changes >= DRIBBLE_MIN_DIRECTION_CHANGES:
+                _add_event(events, last_events, match_id,
+                           pid, "dribble", t, DRIBBLE_COOLDOWN, x=bx, y=by)
 
-        # ── Dribble detection ─────────────────────────────────────────
-        poss_dur = entry.get("poss_duration", 0)
-        player_travel = entry.get("player_travel", 0)
-        if poss_dur >= DRIBBLE_MIN_DURATION and player_travel >= DRIBBLE_MIN_PLAYER_TRAVEL:
-            _add_event(events, last_events, match_id,
-                       pid, "dribble", t, cooldown=DRIBBLE_MIN_DURATION,
-                       x=bx, y=by)
+        prev_poss = entry
 
-        prev = entry
+    # ── Goal detection: multi-signal ───────────────────────────────────
+    assigned_tids = set(assignments.keys())
+    for shot_t, shot_pid, shot_bx, shot_by in shot_history:
+        signals = 0
 
-    # ── Phase 5: Goal confirmation (ball disappearance after goal zone) ───
-    goal_candidates = _detect_goal_candidates(
-        all_player_ts, player_by_ts, ball_by_ts, interpolated_ball, ball_gaps,
-        assignments, target_goal_x, possession_tl, timestamps
-    )
+        # Signal 1: ball disappears after shot
+        disappear = _measure_disappearance_after(shot_t, all_ts, ball_original_ts)
+        if disappear >= GOAL_DISAPPEAR_MIN:
+            signals += 1
 
-    for gt, gpid, gx, gy in goal_candidates:
-        added = _add_event(events, last_events, match_id,
-                           gpid, "goal", gt, cooldown=10.0,
-                           x=gx, y=gy)
-        if added:
-            # Assist: last pass before this goal
-            for pt, pp_id, px, py in reversed(pass_chain):
-                if pp_id != gpid and gt - pt < ASSIST_WINDOW:
-                    _add_event(events, last_events, match_id,
-                               pp_id, "assist", pt, cooldown=10.0,
-                               x=px, y=py)
-                    break
+        # Signal 2: team convergence (celebration) within 5s after shot
+        convergence = _measure_team_convergence(
+            shot_t, all_ts, player_by_ts, assigned_tids,
+            window=5.0, radius=GOAL_CONVERGENCE_RADIUS,
+            min_players=GOAL_CONVERGENCE_MIN,
+        )
+        if convergence:
+            signals += 1
 
-    # ── Phase 6: Post-processing ──────────────────────────────────────────
-    goal_times = {e["timestamp_seconds"] for e in events if e["event_type"] == "goal"}
-    goal_players = {e["player_id"] for e in events if e["event_type"] == "goal"}
+        # Signal 3: play stoppage (team stops moving) within 3s after shot
+        stoppage = _measure_play_stoppage(
+            shot_t, all_ts, player_by_ts, assigned_tids,
+            window=3.0, speed_threshold=GOAL_STOPPAGE_SPEED,
+        )
+        if stoppage:
+            signals += 1
 
-    # Remove shots that became goals (within 5s, same player)
+        if signals >= GOAL_SIGNAL_MIN:
+            added = _add_event(events, last_events, match_id,
+                               shot_pid, "goal", shot_t, GOAL_COOLDOWN,
+                               x=shot_bx, y=shot_by)
+            if added:
+                # Assist: last pass before goal by a different player
+                for pt, pp_id, px, py in reversed(pass_history):
+                    if pp_id != shot_pid and shot_t - pt < ASSIST_WINDOW:
+                        _add_event(events, last_events, match_id,
+                                   pp_id, "assist", pt, cooldown=10.0, x=px, y=py)
+                        break
+
+    # ── Post-processing ──────────────────────────────────────────────────
+    # Remove shots that became goals
+    goal_set = {(e["player_id"], e["timestamp_seconds"]) for e in events if e["event_type"] == "goal"}
     events[:] = [
         e for e in events
-        if not (
-            e["event_type"] == "shot"
-            and e["player_id"] in goal_players
-            and any(abs(e["timestamp_seconds"] - gt) < 5 for gt in goal_times)
-        )
+        if not (e["event_type"] == "shot"
+                and (e["player_id"], e["timestamp_seconds"]) in goal_set)
     ]
 
-    # ── Sort & persist ────────────────────────────────────────────────────
+    # Sort and persist
     events.sort(key=lambda e: e["timestamp_seconds"])
 
     db.query(MatchEvent).filter_by(match_id=match_id).delete()
@@ -252,102 +244,12 @@ def detect_events(match_id: int, db: Session, attacks_right: bool = True) -> lis
     return events
 
 
-# ── Ball interpolation ────────────────────────────────────────────────────────
-
-def _interpolate_ball_positions(all_player_ts, ball_by_ts):
-    """
-    Interpolate ball positions for player timestamps that lack ball data.
-
-    Strategy:
-    - Gap < 2.0s: linear interpolation (confident)
-    - Gap 2-5s: linear interpolation (low confidence, still usable)
-    - Gap > 5s: no interpolation (returns None for that timestamp)
-
-    Returns augmented dict: {timestamp: (x, y)} containing both original and
-    interpolated ball positions. Timestamps with gaps > 5s are omitted.
-    """
-    result = {}
-
-    # Copy all original ball positions
-    for t, pos in ball_by_ts.items():
-        result[t] = pos
-
-    if not ball_by_ts:
-        return result
-
-    # Build sorted list of known ball timestamps
-    known_ts = sorted(ball_by_ts.keys())
-
-    if len(known_ts) < 2:
-        return result
-
-    # For each player timestamp without ball data, try to interpolate
-    ki = 0  # index into known_ts
-    for t in all_player_ts:
-        if t in result:
-            continue  # already have ball data
-
-        # Advance ki so known_ts[ki] is the last known ts <= t
-        while ki < len(known_ts) - 1 and known_ts[ki + 1] <= t:
-            ki += 1
-
-        # Find surrounding known timestamps
-        prev_t = None
-        next_t = None
-
-        if ki < len(known_ts) and known_ts[ki] <= t:
-            prev_t = known_ts[ki]
-        elif ki > 0:
-            prev_t = known_ts[ki - 1]
-
-        # Find next known timestamp after t
-        for j in range(max(ki, 0), len(known_ts)):
-            if known_ts[j] > t:
-                next_t = known_ts[j]
-                break
-
-        if prev_t is None and next_t is None:
-            continue
-
-        # Only prev known
-        if prev_t is not None and next_t is None:
-            gap = t - prev_t
-            if gap <= INTERP_GAP_MAX_LOW_CONF:
-                result[t] = ball_by_ts[prev_t]  # hold last known position
-            continue
-
-        # Only next known
-        if prev_t is None and next_t is not None:
-            gap = next_t - t
-            if gap <= INTERP_GAP_MAX_LOW_CONF:
-                result[t] = ball_by_ts[next_t]  # use next known position
-            continue
-
-        # Both prev and next known — linear interpolation
-        gap = next_t - prev_t
-        if gap > INTERP_GAP_MAX_LOW_CONF:
-            continue  # gap too large, skip
-
-        # Linear interpolation factor
-        alpha = (t - prev_t) / gap if gap > 0 else 0.0
-        x1, y1 = ball_by_ts[prev_t]
-        x2, y2 = ball_by_ts[next_t]
-        ix = x1 + alpha * (x2 - x1)
-        iy = y1 + alpha * (y2 - y1)
-        result[t] = (ix, iy)
-
-    return result
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
+# ── Data loading ─────────────────────────────────────────────────────────────
 
 def _load_assignments(match_id: int, db: Session) -> dict:
-    """Load track_id → player info mapping. Excludes referee tracks."""
     assignments = {}
     for a in db.query(TrackAssignment).filter_by(match_id=match_id).all():
-        if a.is_referee:
-            continue  # skip referee — excluded from all event analysis
-        if not a.player_id:
+        if a.is_referee or not a.player_id:
             continue
         player = db.query(Player).filter_by(id=a.player_id).first()
         if player:
@@ -360,7 +262,6 @@ def _load_assignments(match_id: int, db: Session) -> dict:
 
 
 def _load_tracking_data(match_id: int, db: Session):
-    """Load player tracking and ball data, indexed by timestamp."""
     tracking = (
         db.query(TrackingFrame)
         .filter_by(match_id=match_id)
@@ -375,8 +276,8 @@ def _load_tracking_data(match_id: int, db: Session):
         player_by_ts[t].append({
             "track_id": tf.track_id,
             "cx": tf.bbox_x + tf.bbox_w / 2,
-            "foot_y": tf.bbox_y + tf.bbox_h,
             "cy": tf.bbox_y + tf.bbox_h / 2,
+            "foot_y": tf.bbox_y + tf.bbox_h,
         })
 
     ball_frames = (
@@ -385,112 +286,164 @@ def _load_tracking_data(match_id: int, db: Session):
         .order_by(BallFrame.timestamp_seconds)
         .all()
     )
-    ball_by_ts = {bf.timestamp_seconds: (bf.x, bf.y) for bf in ball_frames}
+    ball_raw = {bf.timestamp_seconds: ((bf.x, bf.y), bf.confidence) for bf in ball_frames}
 
-    return player_by_ts, ball_by_ts
+    return player_by_ts, ball_raw
 
 
-# ── Possession timeline with hysteresis ───────────────────────────────────────
+# ── Ball interpolation (linear + spline) ─────────────────────────────────────
 
-def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments):
+def _interpolate_ball(all_ts, ball_hq):
+    """Interpolate ball positions in gaps.
+
+    - Gaps <= INTERP_LINEAR_MAX_GAP: linear interpolation
+    - Gaps <= INTERP_SPLINE_MAX_GAP: Catmull-Rom spline (uses 2 points before/after)
     """
-    Build frame-by-frame possession with hysteresis to prevent flickering.
+    result = dict(ball_hq)
+    if len(ball_hq) < 2:
+        return result
 
-    Handles None ball positions: maintains current possessor without switching,
-    and appends timeline entry with last known ball position.
+    known_ts = sorted(ball_hq.keys())
 
-    Returns list of dicts with:
-      t, bx, by, possessor (track_id or None), poss_duration, player_travel, ball_known
-    """
+    # Build gap list: [(gap_start_idx, gap_end_idx)] in known_ts
+    # For each timestamp not in ball_hq, find surrounding known points
+    ki = 0
+    for t in all_ts:
+        if t in result:
+            continue
+        # Advance ki
+        while ki < len(known_ts) - 1 and known_ts[ki + 1] <= t:
+            ki += 1
+
+        prev_t = known_ts[ki] if ki < len(known_ts) and known_ts[ki] <= t else None
+        next_idx = None
+        for j in range(max(ki, 0), len(known_ts)):
+            if known_ts[j] > t:
+                next_idx = j
+                break
+
+        if prev_t is None or next_idx is None:
+            continue
+
+        next_t = known_ts[next_idx]
+        gap = next_t - prev_t
+        prev_idx = ki
+
+        if gap <= INTERP_LINEAR_MAX_GAP:
+            # Linear interpolation
+            alpha = (t - prev_t) / gap if gap > 0 else 0
+            x1, y1 = ball_hq[prev_t]
+            x2, y2 = ball_hq[next_t]
+            result[t] = (x1 + alpha * (x2 - x1), y1 + alpha * (y2 - y1))
+
+        elif gap <= INTERP_SPLINE_MAX_GAP:
+            # Catmull-Rom spline using 4 control points
+            p0_idx = prev_idx - 1 if prev_idx > 0 else prev_idx
+            p3_idx = next_idx + 1 if next_idx < len(known_ts) - 1 else next_idx
+
+            p0 = ball_hq[known_ts[p0_idx]]
+            p1 = ball_hq[prev_t]
+            p2 = ball_hq[next_t]
+            p3 = ball_hq[known_ts[p3_idx]]
+
+            alpha = (t - prev_t) / gap if gap > 0 else 0
+            x = _catmull_rom(alpha, p0[0], p1[0], p2[0], p3[0])
+            y = _catmull_rom(alpha, p0[1], p1[1], p2[1], p3[1])
+            # Clamp to valid range
+            result[t] = (max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
+
+    return result
+
+
+def _catmull_rom(t, p0, p1, p2, p3):
+    """Catmull-Rom spline interpolation at parameter t in [0,1]."""
+    return 0.5 * (
+        2 * p1
+        + (-p0 + p2) * t
+        + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t
+        + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t
+    )
+
+
+# ── Possession timeline ──────────────────────────────────────────────────────
+
+def _build_possession(timestamps, player_by_ts, ball, assignments):
     timeline = []
-    current_possessor = None
-    possession_since = None
-    possession_start_pos = None
+    current = None
+    poss_since = None
+    poss_start_pos = None
     challenger = None
     challenger_streak = 0
-    last_known_bx = 0.5
-    last_known_by = 0.5
+
+    # Direction tracking for dribble detection
+    direction_history = {}  # tid -> list of (x, y) positions during possession
 
     for t in timestamps:
-        ball_pos = ball_by_ts.get(t)
         players = player_by_ts.get(t, [])
+        ball_pos = ball.get(t)
+        has_ball = ball_pos is not None
 
-        if ball_pos is None:
-            # No ball data: maintain current possessor, use last known ball position
-            poss_dur = (t - possession_since) if possession_since else 0
-            player_travel = 0
-            if possession_start_pos and current_possessor:
+        if not has_ball:
+            poss_dur = (t - poss_since) if poss_since else 0
+            travel = 0
+            dir_changes = 0
+            if current and poss_start_pos:
                 for p in players:
-                    if p["track_id"] == current_possessor:
-                        player_travel = _dist(p["cx"], p["cy"],
-                                              possession_start_pos[0], possession_start_pos[1])
+                    if p["track_id"] == current:
+                        travel = _dist(p["cx"], p["cy"], *poss_start_pos)
                         break
-
+                dir_changes = _count_direction_changes(
+                    direction_history.get(current, []))
             timeline.append({
-                "t": t, "bx": last_known_bx, "by": last_known_by,
-                "possessor": current_possessor,
-                "poss_duration": poss_dur,
-                "player_travel": player_travel,
-                "ball_known": False,
+                "t": t, "bx": 0.5, "by": 0.5,
+                "possessor": current, "has_ball": False,
+                "poss_duration": poss_dur, "player_travel": travel,
+                "direction_changes": dir_changes,
             })
             continue
 
         bx, by = ball_pos
-        last_known_bx = bx
-        last_known_by = by
-
-        nearest_track = None
+        nearest = None
         nearest_dist = float("inf")
-        current_poss_dist = float("inf")
+        current_dist = float("inf")
 
         for p in players:
             tid = p["track_id"]
             if tid not in assignments:
                 continue
             d = _dist(p["cx"], p["foot_y"], bx, by)
-
             effective_d = d
-            if tid == current_possessor:
+            if tid == current:
                 effective_d = max(0, d - POSSESSION_STICKY_BONUS)
-                current_poss_dist = d
-
+                current_dist = d
             if effective_d < nearest_dist:
                 nearest_dist = effective_d
-                nearest_track = tid
+                nearest = tid
 
-        if nearest_track is None or nearest_dist > POSSESSION_DIST:
-            if current_possessor is not None and current_poss_dist <= POSSESSION_DIST * 1.5:
+        if nearest is None or nearest_dist > POSSESSION_RADIUS:
+            if current is not None and current_dist <= POSSESSION_RADIUS * 1.8:
                 pass
             else:
-                current_possessor = None
-                possession_since = None
-                possession_start_pos = None
+                current = None
+                poss_since = None
+                poss_start_pos = None
                 challenger = None
                 challenger_streak = 0
-
-            poss_dur = (t - possession_since) if possession_since else 0
-            timeline.append({
-                "t": t, "bx": bx, "by": by,
-                "possessor": current_possessor,
-                "poss_duration": poss_dur,
-                "player_travel": 0,
-                "ball_known": True,
-            })
-            continue
-
-        if nearest_track != current_possessor:
-            if nearest_track == challenger:
+                direction_history.clear()
+        elif nearest != current:
+            if nearest == challenger:
                 challenger_streak += 1
             else:
-                challenger = nearest_track
+                challenger = nearest
                 challenger_streak = 1
-
-            if challenger_streak >= POSSESSION_HYSTERESIS or current_possessor is None:
-                current_possessor = nearest_track
-                possession_since = t
+            if challenger_streak >= POSSESSION_HYSTERESIS or current is None:
+                current = nearest
+                poss_since = t
+                direction_history[current] = []
                 for p in players:
-                    if p["track_id"] == nearest_track:
-                        possession_start_pos = (p["cx"], p["cy"])
+                    if p["track_id"] == nearest:
+                        poss_start_pos = (p["cx"], p["cy"])
+                        direction_history[current].append(poss_start_pos)
                         break
                 challenger = None
                 challenger_streak = 0
@@ -498,265 +451,211 @@ def _build_possession_timeline(timestamps, player_by_ts, ball_by_ts, assignments
             challenger = None
             challenger_streak = 0
 
-        poss_dur = (t - possession_since) if possession_since else 0
-        player_travel = 0
-        if possession_start_pos and current_possessor:
+        # Track position for direction changes
+        if current:
             for p in players:
-                if p["track_id"] == current_possessor:
-                    player_travel = _dist(p["cx"], p["cy"],
-                                          possession_start_pos[0], possession_start_pos[1])
+                if p["track_id"] == current:
+                    if current not in direction_history:
+                        direction_history[current] = []
+                    direction_history[current].append((p["cx"], p["cy"]))
                     break
+
+        poss_dur = (t - poss_since) if poss_since else 0
+        travel = 0
+        dir_changes = 0
+        if current and poss_start_pos:
+            for p in players:
+                if p["track_id"] == current:
+                    travel = _dist(p["cx"], p["cy"], *poss_start_pos)
+                    break
+            dir_changes = _count_direction_changes(
+                direction_history.get(current, []))
 
         timeline.append({
             "t": t, "bx": bx, "by": by,
-            "possessor": current_possessor,
-            "poss_duration": poss_dur,
-            "player_travel": player_travel,
-            "ball_known": True,
+            "possessor": current, "has_ball": True,
+            "poss_duration": poss_dur, "player_travel": travel,
+            "direction_changes": dir_changes,
         })
 
     return timeline
 
 
-# ── Ball velocity ─────────────────────────────────────────────────────────────
+def _count_direction_changes(positions):
+    """Count significant direction changes in a position trace."""
+    if len(positions) < 3:
+        return 0
 
-def _compute_ball_velocity(timestamps, ball_by_ts):
-    """Compute ball speed between consecutive frames. Returns {timestamp: speed}."""
+    # Sample every few positions to reduce noise
+    step = max(1, len(positions) // 20)
+    sampled = positions[::step]
+    if len(sampled) < 3:
+        return 0
+
+    changes = 0
+    for i in range(1, len(sampled) - 1):
+        x0, y0 = sampled[i - 1]
+        x1, y1 = sampled[i]
+        x2, y2 = sampled[i + 1]
+
+        dx1, dy1 = x1 - x0, y1 - y0
+        dx2, dy2 = x2 - x1, y2 - y1
+
+        len1 = math.hypot(dx1, dy1)
+        len2 = math.hypot(dx2, dy2)
+        if len1 < 0.001 or len2 < 0.001:
+            continue
+
+        # Angle between consecutive direction vectors
+        cos_angle = (dx1 * dx2 + dy1 * dy2) / (len1 * len2)
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+        angle_deg = math.degrees(math.acos(cos_angle))
+
+        if angle_deg >= DRIBBLE_DIRECTION_ANGLE:
+            changes += 1
+
+    return changes
+
+
+# ── Ball velocity ────────────────────────────────────────────────────────────
+
+def _compute_velocity(ball_ts, ball):
     velocity = {}
-    for i in range(1, len(timestamps)):
-        t_prev, t_curr = timestamps[i - 1], timestamps[i]
+    for i in range(1, len(ball_ts)):
+        t_prev, t_curr = ball_ts[i - 1], ball_ts[i]
         dt = t_curr - t_prev
-        if dt <= 0:
+        if dt <= 0 or dt > 0.5:
             velocity[t_curr] = 0
             continue
-        pos_prev = ball_by_ts.get(t_prev)
-        pos_curr = ball_by_ts.get(t_curr)
-        if pos_prev is None or pos_curr is None:
-            velocity[t_curr] = 0
-            continue
-        x1, y1 = pos_prev
-        x2, y2 = pos_curr
-        dist = _dist(x1, y1, x2, y2)
-        velocity[t_curr] = dist / dt
-    if timestamps:
-        velocity[timestamps[0]] = 0
+        x1, y1 = ball[t_prev]
+        x2, y2 = ball[t_curr]
+        velocity[t_curr] = _dist(x1, y1, x2, y2) / dt
+    if ball_ts:
+        velocity[ball_ts[0]] = 0
     return velocity
 
 
-# ── Ball gap map ──────────────────────────────────────────────────────────────
-
-def _build_ball_gaps(all_player_ts, ball_ts_set):
-    """For each timestamp without ball detection, compute gap duration until ball reappears."""
-    ball_gaps = {}
-    for i, t in enumerate(all_player_ts):
-        if t not in ball_ts_set:
-            gap_end = t
-            for t2 in all_player_ts[i:]:
-                if t2 in ball_ts_set:
-                    gap_end = t2
-                    break
-                gap_end = t2
-            ball_gaps[t] = gap_end - t
-    return ball_gaps
+def _rolling_avg_speed(ball_ts, velocity, window=2.0):
+    """Rolling average ball speed over a time window."""
+    avg = {}
+    for i, t in enumerate(ball_ts):
+        speeds = []
+        for j in range(max(0, i - 30), i):
+            t2 = ball_ts[j]
+            if t - t2 > window:
+                continue
+            if t2 in velocity:
+                speeds.append(velocity[t2])
+        avg[t] = sum(speeds) / len(speeds) if speeds else 0.01
+    return avg
 
 
-# ── Shot heuristic: ball disappearance near goal ─────────────────────────────
+# ── Goal detection signals ───────────────────────────────────────────────────
 
-def _check_shot_on_disappearance(t, pid, bx, by, dist_to_goal, all_player_ts,
-                                  ball_ts_set_original, events, last_events,
-                                  match_id, pass_chain):
-    """
-    Heuristic: if player has possession near goal and ball disappears from
-    original detections for >0.5s, register as shot candidate.
-    """
-    # Find where t is in the timeline
-    try:
-        idx = all_player_ts.index(t)
-    except ValueError:
-        return
+def _measure_disappearance_after(t, all_ts, ball_ts_set):
+    """After a shot at time t, measure how long ball disappears."""
+    idx = bisect.bisect_right(all_ts, t)
 
-    # Look ahead for ball disappearance
-    disappear_start = None
-    for j in range(idx + 1, min(idx + 30, len(all_player_ts))):
-        t2 = all_player_ts[j]
-        if t2 in ball_ts_set_original:
-            if disappear_start is not None:
-                break  # ball came back
-            continue
-        else:
-            if disappear_start is None:
-                disappear_start = t2
-
-    if disappear_start is None:
-        return
-
-    # Find how long ball is gone
-    disappear_end = disappear_start
-    for j in range(all_player_ts.index(disappear_start), len(all_player_ts)):
-        t2 = all_player_ts[j]
-        if t2 in ball_ts_set_original:
-            break
-        disappear_end = t2
-
-    gap_duration = disappear_end - disappear_start
-    if gap_duration < 0.5:
-        return
-
-    added = _add_event(events, last_events, match_id,
-                       pid, "shot", t, cooldown=3.0,
-                       x=bx, y=by)
-    if added:
-        for pt, pp_id, px, py in reversed(pass_chain):
-            if pp_id != pid and t - pt < KEY_PASS_WINDOW:
-                _add_event(events, last_events, match_id,
-                           pp_id, "key_pass", pt, cooldown=5.0,
-                           x=px, y=py)
-                break
-
-
-# ── Goal detection (ball disappearance confirmation) ──────────────────────────
-
-def _detect_goal_candidates(all_player_ts, player_by_ts, ball_by_ts, interpolated_ball,
-                            ball_gaps, assignments, target_goal_x, possession_tl,
-                            timestamps):
-    """
-    Detect goals by finding frames where:
-    1. Ball enters goal zone (correct side for the team)
-    2. Ball Y is within goal post range
-    3. Ball then disappears for GOAL_DISAPPEAR_MIN+ seconds
-
-    Also detects goals via possession near goal + ball disappearance,
-    even without ball being seen in the exact goal zone.
-    """
-    poss_at_t = {}
-    for entry in possession_tl:
-        if entry["possessor"] and entry["possessor"] in assignments:
-            info = assignments[entry["possessor"]]
-            poss_at_t[entry["t"]] = info["player_id"]
-
-    ball_ts_set = set(ball_by_ts.keys())
-    candidates = []
-    candidate = None  # (t, player_id, ball_x, ball_y)
-
-    # Strategy 1: Ball seen in goal zone + disappearance (original logic with relaxed zone)
-    for t in all_player_ts:
-        if t in ball_ts_set:
-            bx, by = ball_by_ts[t]
-
-            in_goal_zone = abs(bx - target_goal_x) < GOAL_ZONE_X
-            y_in_goal = GOAL_Y_MIN <= by <= GOAL_Y_MAX
-
-            if in_goal_zone and y_in_goal:
-                possessor_pid = _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0)
-                if possessor_pid:
-                    candidate = (t, possessor_pid, bx, by)
-        else:
-            if candidate is not None:
-                gap = ball_gaps.get(t, 0)
-                if gap >= GOAL_DISAPPEAR_MIN:
-                    candidates.append(candidate)
-                    candidate = None
-
-    # Strategy 2: Ball seen in goal zone via interpolated positions
-    # Use a slightly wider zone for interpolated data
-    INTERP_GOAL_ZONE_X = GOAL_ZONE_X  # already relaxed to 0.06
-    for t in all_player_ts:
-        if t in ball_ts_set:
-            continue  # already handled above
-        if t not in interpolated_ball:
-            continue
-
-        bx, by = interpolated_ball[t]
-        in_goal_zone = abs(bx - target_goal_x) < INTERP_GOAL_ZONE_X
-        y_in_goal = GOAL_Y_MIN <= by <= GOAL_Y_MAX
-
-        if in_goal_zone and y_in_goal:
-            possessor_pid = _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0)
-            if possessor_pid:
-                # Check for ball disappearance after
-                gap = ball_gaps.get(t, 0)
-                if gap >= GOAL_DISAPPEAR_MIN:
-                    cand = (t, possessor_pid, bx, by)
-                    # Avoid duplicates (within 5s of existing candidate)
-                    if not any(abs(c[0] - t) < 5.0 for c in candidates):
-                        candidates.append(cand)
-
-    # Strategy 3: Possession near goal + ball disappearance
-    # If a player had possession within SHOT_ZONE_X of goal and ball disappears
-    # for >1s, treat as goal candidate even without ball in exact goal zone
-    _POSS_NEAR_GOAL_DISAPPEAR = 1.0  # ball must vanish 1s+ for this heuristic
-    for entry in possession_tl:
-        if not entry["possessor"] or entry["possessor"] not in assignments:
-            continue
-        if not entry.get("ball_known", True):
-            continue
-
-        bx = entry["bx"]
-        dist_to_goal = abs(bx - target_goal_x)
-        if dist_to_goal > SHOT_ZONE_X:
-            continue
-
-        t = entry["t"]
-        pid = assignments[entry["possessor"]]["player_id"]
-
-        # Check if ball disappears shortly after this frame
-        gap_after = _find_gap_after(t, all_player_ts, ball_ts_set)
-        if gap_after >= _POSS_NEAR_GOAL_DISAPPEAR:
-            cand = (t, pid, bx, entry["by"])
-            # Only add if not within 5s of existing candidate
-            if not any(abs(c[0] - t) < 5.0 for c in candidates):
-                candidates.append(cand)
-
-    return candidates
-
-
-def _find_gap_after(t, all_player_ts, ball_ts_set):
-    """Find how long the ball disappears after timestamp t."""
-    try:
-        idx = all_player_ts.index(t)
-    except ValueError:
-        # Binary search fallback
-        import bisect
-        idx = bisect.bisect_left(all_player_ts, t)
-
-    # Look for start of gap
     gap_start = None
-    for j in range(idx + 1, len(all_player_ts)):
-        t2 = all_player_ts[j]
-        if t2 not in ball_ts_set:
-            gap_start = t2
+    for j in range(idx, min(idx + 60, len(all_ts))):
+        if all_ts[j] not in ball_ts_set:
+            gap_start = all_ts[j]
             break
 
     if gap_start is None:
         return 0
 
-    # Find end of gap
     gap_end = gap_start
-    start_idx = all_player_ts.index(gap_start)
-    for j in range(start_idx, len(all_player_ts)):
-        t2 = all_player_ts[j]
-        if t2 in ball_ts_set:
+    gap_idx = bisect.bisect_left(all_ts, gap_start)
+    for j in range(gap_idx, len(all_ts)):
+        if all_ts[j] in ball_ts_set:
             break
-        gap_end = t2
+        gap_end = all_ts[j]
 
     return gap_end - gap_start
 
 
-def _find_possessor_near_t(t, poss_at_t, timestamps, window=3.0):
-    """Find the possessor player_id at or just before timestamp t (within window seconds)."""
-    if t in poss_at_t:
-        return poss_at_t[t]
-    for ts in reversed(timestamps):
-        if ts > t:
-            continue
-        if t - ts > window:
+def _measure_team_convergence(shot_t, all_ts, player_by_ts, assigned_tids,
+                               window=5.0, radius=0.15, min_players=3):
+    """Check if teammates converge (celebrate) after a shot."""
+    idx = bisect.bisect_right(all_ts, shot_t)
+    end_t = shot_t + window
+
+    for j in range(idx, len(all_ts)):
+        t = all_ts[j]
+        if t > end_t:
             break
-        if ts in poss_at_t:
-            return poss_at_t[ts]
+
+        players = player_by_ts.get(t, [])
+        team_players = [p for p in players if p["track_id"] in assigned_tids]
+        if len(team_players) < min_players:
+            continue
+
+        # Check if any cluster of min_players exists within radius
+        for anchor in team_players:
+            nearby = sum(
+                1 for p in team_players
+                if _dist(p["cx"], p["cy"], anchor["cx"], anchor["cy"]) <= radius
+            )
+            if nearby >= min_players:
+                return True
+
+    return False
+
+
+def _measure_play_stoppage(shot_t, all_ts, player_by_ts, assigned_tids,
+                            window=3.0, speed_threshold=0.005):
+    """Check if play stops (all players slow down) after a shot."""
+    idx = bisect.bisect_right(all_ts, shot_t)
+    end_t = shot_t + window
+
+    # Collect average team speed in the window 1-3s after shot
+    prev_positions = {}
+    low_speed_frames = 0
+    total_frames = 0
+
+    for j in range(idx, len(all_ts)):
+        t = all_ts[j]
+        if t > end_t:
+            break
+        if t < shot_t + 1.0:
+            # Skip first second (ball still in flight)
+            players = player_by_ts.get(t, [])
+            for p in players:
+                if p["track_id"] in assigned_tids:
+                    prev_positions[p["track_id"]] = (p["cx"], p["cy"])
+            continue
+
+        players = player_by_ts.get(t, [])
+        team_speeds = []
+        for p in players:
+            tid = p["track_id"]
+            if tid not in assigned_tids:
+                continue
+            if tid in prev_positions:
+                d = _dist(p["cx"], p["cy"], *prev_positions[tid])
+                team_speeds.append(d)
+            prev_positions[tid] = (p["cx"], p["cy"])
+
+        if team_speeds:
+            avg_team_speed = sum(team_speeds) / len(team_speeds)
+            total_frames += 1
+            if avg_team_speed < speed_threshold:
+                low_speed_frames += 1
+
+    # Stoppage if most frames show low speed
+    return total_frames > 0 and low_speed_frames / total_frames > 0.5
+
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+def _find_player_pos(t, track_id, player_by_ts):
+    players = player_by_ts.get(t, [])
+    for p in players:
+        if p["track_id"] == track_id:
+            return (p["cx"], p["cy"])
     return None
 
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def _dist(x1, y1, x2, y2):
     return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
@@ -764,7 +663,6 @@ def _dist(x1, y1, x2, y2):
 
 def _add_event(events, last_events, match_id, player_id, event_type,
                timestamp, cooldown, x=None, y=None) -> bool:
-    """Add event if cooldown has elapsed. Returns True if added."""
     key = (event_type, player_id)
     last_t = last_events.get(key, -999)
     if timestamp - last_t < cooldown:
